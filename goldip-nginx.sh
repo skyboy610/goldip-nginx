@@ -131,6 +131,18 @@ make_location() {
     fi
 }
 
+# ---------------- Find a free local port ----------------
+# Uses globals: USED_PORTS (listening), TAKEN_PORTS (already assigned this run)
+free_port() {
+    local p
+    for p in $(seq 20000 29999); do
+        case " $USED_PORTS " in *" $p "*) continue ;; esac
+        case " $TAKEN_PORTS " in *" $p "*) continue ;; esac
+        echo "$p"; return 0
+    done
+    return 1
+}
+
 # ---------------- Fully automatic: build locations from x-ui DB ----------------
 # Sets global LOCATIONS. Returns 0 on success (>=1 inbound), 1 on failure.
 auto_build_locations() {
@@ -152,45 +164,87 @@ auto_build_locations() {
     ok "Reading inbounds from: $db"
     LOCATIONS=""
     local added=0 skipped=0
+    local SQL_UPDATES=""
+    # SQLite expression to turn TLS off in stream_settings (handles spaced/unspaced JSON)
+    local TLSOFF="stream_settings=replace(replace(stream_settings,'\"security\": \"tls\"','\"security\": \"none\"'),'\"security\":\"tls\"','\"security\":\"none\"')"
+    USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
+    TAKEN_PORTS=""
 
-    # field separator unlikely to appear in JSON
     while IFS='|' read -r port ss; do
         [ -n "$port" ] || continue
         case "$port" in *[!0-9]*) continue ;; esac
-        local net path
+        local net path fport ltype
         net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         path=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
 
         case "$net" in
-            ws|httpupgrade)
-                if [ -z "$path" ]; then
-                    warn "Skip port ${port} (${net}): no path set."
-                    skipped=$((skipped+1)); continue
-                fi
-                LOCATIONS="${LOCATIONS}
-$(make_location upgrade "$path" "$port")"
-                ok "Added ${net} -> ${path} (127.0.0.1:${port})"
-                added=$((added+1))
-                ;;
-            xhttp|splithttp)
-                if [ -z "$path" ]; then
-                    warn "Skip port ${port} (${net}): no path set."
-                    skipped=$((skipped+1)); continue
-                fi
-                LOCATIONS="${LOCATIONS}
-$(make_location xhttp "$path" "$port")"
-                ok "Added xhttp -> ${path} (127.0.0.1:${port})"
-                added=$((added+1))
-                ;;
+            ws|httpupgrade) ltype="upgrade" ;;
+            xhttp|splithttp) ltype="xhttp" ;;
             *)
                 warn "Skip port ${port}: transport '${net:-unknown}' not proxied via Nginx (tcp/reality/grpc handle TLS themselves)."
-                skipped=$((skipped+1))
-                ;;
+                skipped=$((skipped+1)); continue ;;
         esac
+
+        if [ -z "$path" ]; then
+            warn "Skip port ${port} (${net}): no path set."
+            skipped=$((skipped+1)); continue
+        fi
+
+        # Notice if TLS currently on (will be disabled — Nginx terminates TLS)
+        if printf '%s' "$ss" | grep -qE '"security"[ ]*:[ ]*"tls"'; then
+            warn "Inbound ${port}: TLS is ON -> will be set to none (Nginx terminates TLS)."
+        fi
+
+        # Resolve conflict with Nginx listen ports
+        fport="$port"
+        if [ "$port" = "$HTTPS_PORT" ] || [ "$port" = "$HTTP_PORT" ]; then
+            fport=$(free_port) || { err "No free local port available."; return 1; }
+            SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, ${TLSOFF} WHERE port=${port};
+"
+            warn "Port ${port} conflicts with Nginx -> moved inbound to 127.0.0.1:${fport}"
+        else
+            SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', ${TLSOFF} WHERE port=${port};
+"
+        fi
+        TAKEN_PORTS="${TAKEN_PORTS} ${fport}"
+
+        LOCATIONS="${LOCATIONS}
+$(make_location "$ltype" "$path" "$fport")"
+        ok "Added ${net} -> ${path} (127.0.0.1:${fport})"
+        added=$((added+1))
     done < <(sqlite3 -separator '|' "$db" "SELECT port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
 
     echo -e "${INFO}Auto-build done: ${added} added, ${skipped} skipped.${RESET}"
-    [ "$added" -ge 1 ] && return 0 || return 1
+    [ "$added" -ge 1 ] || return 1
+
+    # Apply listen=127.0.0.1 to the database
+    if [ -n "$SQL_UPDATES" ]; then
+        echo -e "${WARN_BG} ACTION ${RESET} Set these inbounds to listen on 127.0.0.1 in the x-ui DB now?"
+        warn "A backup is made first, then x-ui restarts. Tunnel inbounds will only"
+        warn "work AFTER you point the foreign server to the Arvan domain (port ${HTTPS_PORT})."
+        echo -e "${PROMPT}Apply now? [y/N]:${RESET}"
+        read -r AP
+        if [ "$AP" = "y" ] || [ "$AP" = "Y" ]; then
+            local bak="${db}.bak.$(date +%s)"
+            cp "$db" "$bak" && ok "DB backed up: $bak" || { err "Backup failed — aborting DB change."; return 0; }
+            if printf '%s' "$SQL_UPDATES" | sqlite3 "$db" 2>/tmp/sql_err.log; then
+                ok "Database updated (listen=127.0.0.1)."
+                if systemctl restart x-ui 2>/dev/null || x-ui restart 2>/dev/null; then
+                    ok "x-ui restarted."
+                else
+                    warn "Could not auto-restart x-ui. Restart it manually: x-ui restart"
+                fi
+            else
+                err "DB update failed; restoring backup."
+                cp "$bak" "$db"
+                cat /tmp/sql_err.log
+            fi
+        else
+            warn "Skipped DB change. You must set listen=127.0.0.1 manually in the panel,"
+            warn "otherwise inbounds stay public and bypass Nginx."
+        fi
+    fi
+    return 0
 }
 
 # ---------------- Gather inputs ----------------
