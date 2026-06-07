@@ -156,6 +156,7 @@ auto_build_locations() {
     # field separator unlikely to appear in JSON
     while IFS='|' read -r port ss; do
         [ -n "$port" ] || continue
+        case "$port" in *[!0-9]*) continue ;; esac
         local net path
         net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         path=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
@@ -186,7 +187,7 @@ $(make_location xhttp "$path" "$port")"
                 skipped=$((skipped+1))
                 ;;
         esac
-    done < <(sqlite3 -separator '|' "$db" "SELECT port, stream_settings FROM inbounds;" 2>/dev/null)
+    done < <(sqlite3 -separator '|' "$db" "SELECT port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
 
     echo -e "${INFO}Auto-build done: ${added} added, ${skipped} skipped.${RESET}"
     [ "$added" -ge 1 ] && return 0 || return 1
