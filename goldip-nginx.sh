@@ -169,6 +169,7 @@ auto_build_locations() {
     local TLSOFF="stream_settings=replace(replace(stream_settings,'\"security\": \"tls\"','\"security\": \"none\"'),'\"security\":\"tls\"','\"security\":\"none\"')"
     USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""
+    SEEN_PATHS=""
 
     while IFS='|' read -r port ss; do
         [ -n "$port" ] || continue
@@ -189,6 +190,21 @@ auto_build_locations() {
             warn "Skip port ${port} (${net}): no path set."
             skipped=$((skipped+1)); continue
         fi
+
+        # Path "/" conflicts with the camouflage site — cannot coexist
+        if [ "$path" = "/" ]; then
+            warn "Skip port ${port}: path is '/' which collides with the camouflage site."
+            warn "  -> set a unique path for this inbound in x-ui (e.g. /sub${port})."
+            skipped=$((skipped+1)); continue
+        fi
+
+        # Skip duplicate paths (Nginx forbids two identical locations)
+        case " $SEEN_PATHS " in
+            *" $path "*)
+                warn "Skip port ${port}: path '${path}' already used by another inbound."
+                skipped=$((skipped+1)); continue ;;
+        esac
+        SEEN_PATHS="${SEEN_PATHS} ${path}"
 
         # Notice if TLS currently on (will be disabled — Nginx terminates TLS)
         if printf '%s' "$ss" | grep -qE '"security"[ ]*:[ ]*"tls"'; then
@@ -252,6 +268,9 @@ gather_inputs() {
     echo -e "${PROMPT}Domain (e.g. en.goldip.me):${RESET}"
     read -r DOMAIN
     [ -n "$DOMAIN" ] || { err "Domain required."; exit 1; }
+    # allow multiple domains: accept comma or space, normalize to spaces
+    DOMAIN=$(printf '%s' "$DOMAIN" | tr ',' ' ' | tr -s ' ' | sed -E 's/^ +| +$//g')
+    PRIMARY=$(printf '%s' "$DOMAIN" | awk '{print $1}')
 
     echo -e "${PROMPT}HTTPS listen port [443]:${RESET}"
     read -r HTTPS_PORT; HTTPS_PORT=${HTTPS_PORT:-443}
@@ -351,7 +370,7 @@ write_config() {
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null
     rm -f /etc/nginx/conf.d/default.conf 2>/dev/null
 
-    local conf="${NGINX_CONF_DIR}/${DOMAIN}.conf"
+    local conf="${NGINX_CONF_DIR}/${PRIMARY}.conf"
     cat > "$conf" <<EOF
 server {
     listen ${HTTP_PORT};
@@ -368,8 +387,8 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:SSL:10m;
 
-    access_log /var/log/nginx/${DOMAIN}.access.log;
-    error_log  /var/log/nginx/${DOMAIN}.error.log;
+    access_log /var/log/nginx/${PRIMARY}.access.log;
+    error_log  /var/log/nginx/${PRIMARY}.error.log;
 ${LOCATIONS}
     ${CAMO_BLOCK}
 }
@@ -380,10 +399,9 @@ EOF
     if nginx -t 2>/tmp/nginx_test.log; then
         systemctl enable nginx >/dev/null 2>&1
         systemctl restart nginx
-        ok "Nginx running for ${DOMAIN}"
-        echo -e "${INFO}Service URL : ${RESET}https://${DOMAIN}:${HTTPS_PORT}${SVC_PATH}"
-        echo -e "${INFO}Camouflage  : ${RESET}https://${DOMAIN}:${HTTPS_PORT}/"
-        warn "Reminder: set Xray inbound to listen on 127.0.0.1:${SVC_PORT} with path ${SVC_PATH}"
+        ok "Nginx running for: ${DOMAIN}"
+        echo -e "${INFO}Camouflage  : ${RESET}https://${PRIMARY}:${HTTPS_PORT}/"
+        warn "Ensure each proxied inbound listens on 127.0.0.1 with a unique path."
     else
         err "Config test failed:"
         cat /tmp/nginx_test.log
