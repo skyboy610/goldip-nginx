@@ -144,7 +144,9 @@ free_port() {
 }
 
 # ---------------- Fully automatic: build locations from x-ui DB ----------------
-# Sets global LOCATIONS. Returns 0 on success (>=1 inbound), 1 on failure.
+# Lists all inbounds numbered, lets user pick which go behind Nginx.
+# Selected -> listen 127.0.0.1, TLS off, location built. Unselected -> untouched.
+# Sets global LOCATIONS. Returns 0 on success (>=1 selected & built), 1 otherwise.
 auto_build_locations() {
     local db=""
     for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do
@@ -162,58 +164,68 @@ auto_build_locations() {
     fi
 
     ok "Reading inbounds from: $db"
+
+    # Read all inbounds into parallel arrays
+    local -a IN_PORT IN_NET IN_PATH
+    local idx=0 port ss net rawpath path
+    while IFS='|' read -r port ss; do
+        [ -n "$port" ] || continue
+        case "$port" in *[!0-9]*) continue ;; esac
+        net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
+        rawpath=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
+        path=${rawpath%%\?*}   # strip query string for Nginx location
+        idx=$((idx+1))
+        IN_PORT[$idx]="$port"
+        IN_NET[$idx]="${net:-unknown}"
+        IN_PATH[$idx]="$path"
+    done < <(sqlite3 -separator '|' "$db" "SELECT port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
+
+    [ "$idx" -ge 1 ] || { warn "No inbounds found in database."; return 1; }
+
+    # Numbered list
+    echo -e "${INFO}Inbounds found:${RESET}"
+    local n
+    for n in $(seq 1 "$idx"); do
+        echo -e "  ${M8}${n})${RESET} ${M4}port ${IN_PORT[$n]}${RESET} | ${M5}${IN_NET[$n]}${RESET} | ${M1}${IN_PATH[$n]:-(no path)}${RESET}"
+    done
+    echo -e "${PROMPT}Which inbounds go BEHIND Nginx? (comma-separated, e.g. 1,3,4)${RESET}"
+    echo -e "${INFO}Leave tunnel inbounds OUT — they stay direct on 0.0.0.0 and are not touched.${RESET}"
+    read -r SEL
+    [ -n "$SEL" ] || { warn "Nothing selected."; return 1; }
+
     LOCATIONS=""
     local added=0 skipped=0
     local SQL_UPDATES=""
-    # SQLite expression to turn TLS off in stream_settings (handles spaced/unspaced JSON)
     local TLSOFF="stream_settings=replace(replace(stream_settings,'\"security\": \"tls\"','\"security\": \"none\"'),'\"security\":\"tls\"','\"security\":\"none\"')"
     USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""
     SEEN_PATHS=""
 
-    while IFS='|' read -r port ss; do
-        [ -n "$port" ] || continue
-        case "$port" in *[!0-9]*) continue ;; esac
-        local net path fport ltype
-        net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
-        path=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
-        # Nginx location matches the URI path only — strip any query string (?ed=...)
-        path=${path%%\?*}
+    local sel ltype fport
+    for sel in $(printf '%s' "$SEL" | tr ',' ' '); do
+        case "$sel" in ''|*[!0-9]*) warn "Ignore invalid selection '$sel'."; continue ;; esac
+        if [ "$sel" -lt 1 ] || [ "$sel" -gt "$idx" ]; then
+            warn "Ignore out-of-range selection '$sel'."; continue
+        fi
+        port="${IN_PORT[$sel]}"; net="${IN_NET[$sel]}"; path="${IN_PATH[$sel]}"
 
         case "$net" in
             ws|httpupgrade) ltype="upgrade" ;;
             xhttp|splithttp) ltype="xhttp" ;;
-            *)
-                warn "Skip port ${port}: transport '${net:-unknown}' not proxied via Nginx (tcp/reality/grpc handle TLS themselves)."
-                skipped=$((skipped+1)); continue ;;
+            *) warn "Skip #${sel} (port ${port}): transport '${net}' can't be proxied via Nginx."
+               skipped=$((skipped+1)); continue ;;
         esac
 
-        if [ -z "$path" ]; then
-            warn "Skip port ${port} (${net}): no path set."
+        if [ -z "$path" ] || [ "$path" = "/" ]; then
+            warn "Skip #${sel} (port ${port}): path '${path:-empty}' needs a unique non-root value."
             skipped=$((skipped+1)); continue
         fi
-
-        # Path "/" conflicts with the camouflage site — cannot coexist
-        if [ "$path" = "/" ]; then
-            warn "Skip port ${port}: path is '/' which collides with the camouflage site."
-            warn "  -> set a unique path for this inbound in x-ui (e.g. /sub${port})."
-            skipped=$((skipped+1)); continue
-        fi
-
-        # Skip duplicate paths (Nginx forbids two identical locations)
         case " $SEEN_PATHS " in
-            *" $path "*)
-                warn "Skip port ${port}: path '${path}' already used by another inbound."
-                skipped=$((skipped+1)); continue ;;
+            *" $path "*) warn "Skip #${sel} (port ${port}): path '${path}' duplicate."
+                         skipped=$((skipped+1)); continue ;;
         esac
         SEEN_PATHS="${SEEN_PATHS} ${path}"
 
-        # Notice if TLS currently on (will be disabled — Nginx terminates TLS)
-        if printf '%s' "$ss" | grep -qE '"security"[ ]*:[ ]*"tls"'; then
-            warn "Inbound ${port}: TLS is ON -> will be set to none (Nginx terminates TLS)."
-        fi
-
-        # Resolve conflict with Nginx listen ports
         fport="$port"
         if [ "$port" = "$HTTPS_PORT" ] || [ "$port" = "$HTTP_PORT" ]; then
             fport=$(free_port) || { err "No free local port available."; return 1; }
@@ -228,25 +240,24 @@ auto_build_locations() {
 
         LOCATIONS="${LOCATIONS}
 $(make_location "$ltype" "$path" "$fport")"
-        ok "Added ${net} -> ${path} (127.0.0.1:${fport})"
+        ok "Added #${sel} ${net} -> ${path} (127.0.0.1:${fport})"
         added=$((added+1))
-    done < <(sqlite3 -separator '|' "$db" "SELECT port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
+    done
 
-    echo -e "${INFO}Auto-build done: ${added} added, ${skipped} skipped.${RESET}"
+    echo -e "${INFO}Selected: ${added} added, ${skipped} skipped. Unselected inbounds untouched.${RESET}"
     [ "$added" -ge 1 ] || return 1
 
-    # Apply listen=127.0.0.1 to the database
+    # Apply listen=127.0.0.1 + TLS off to the database for selected inbounds
     if [ -n "$SQL_UPDATES" ]; then
-        echo -e "${WARN_BG} ACTION ${RESET} Set these inbounds to listen on 127.0.0.1 in the x-ui DB now?"
-        warn "A backup is made first, then x-ui restarts. Tunnel inbounds will only"
-        warn "work AFTER you point the foreign server to the Arvan domain (port ${HTTPS_PORT})."
+        echo -e "${WARN_BG} ACTION ${RESET} Apply listen=127.0.0.1 (and TLS off) to the SELECTED inbounds now?"
+        warn "A backup is made first, then x-ui restarts. Unselected (tunnel) inbounds are NOT changed."
         echo -e "${PROMPT}Apply now? [y/N]:${RESET}"
         read -r AP
         if [ "$AP" = "y" ] || [ "$AP" = "Y" ]; then
             local bak="${db}.bak.$(date +%s)"
             cp "$db" "$bak" && ok "DB backed up: $bak" || { err "Backup failed — aborting DB change."; return 0; }
             if printf '%s' "$SQL_UPDATES" | sqlite3 "$db" 2>/tmp/sql_err.log; then
-                ok "Database updated (listen=127.0.0.1)."
+                ok "Database updated."
                 if systemctl restart x-ui 2>/dev/null || x-ui restart 2>/dev/null; then
                     ok "x-ui restarted."
                 else
@@ -258,8 +269,8 @@ $(make_location "$ltype" "$path" "$fport")"
                 cat /tmp/sql_err.log
             fi
         else
-            warn "Skipped DB change. You must set listen=127.0.0.1 manually in the panel,"
-            warn "otherwise inbounds stay public and bypass Nginx."
+            warn "Skipped DB change. Selected inbounds must listen on 127.0.0.1 manually,"
+            warn "otherwise they stay public and bypass Nginx."
         fi
     fi
     return 0
