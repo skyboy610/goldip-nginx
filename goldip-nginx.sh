@@ -177,6 +177,8 @@ auto_build_locations() {
         local net path fport ltype
         net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         path=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
+        # Nginx location matches the URI path only — strip any query string (?ed=...)
+        path=${path%%\?*}
 
         case "$net" in
             ws|httpupgrade) ltype="upgrade" ;;
