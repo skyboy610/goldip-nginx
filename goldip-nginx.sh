@@ -7,10 +7,14 @@
 #  path to the local service. Supports OFFLINE install for
 #  Iran servers (place .deb files in ./nginx-offline/).
 #
-#  Fixes in this build:
-#   - Cloudflare CDN IP ranges added to firewall (v4 + v6)
-#   - Reboot persistence: nginx + x-ui auto-start & self-heal
-#   - Color-coded log viewer rewritten (auto-discovers logs)
+#  Behaviour:
+#   - Questions are cyan; defaults/examples are white.
+#   - Red / yellow / green are reserved for status messages.
+#   - Any wrong answer re-asks on the spot (no full restart).
+#   - sqlite3 is auto-installed when needed.
+#   - Cloudflare CDN ranges (v4+v6) supported in firewall.
+#   - nginx + x-ui auto-start and self-heal after reboot.
+#   - Color-coded log viewer that auto-discovers logs.
 # ============================================================
 
 set -uo pipefail
@@ -31,10 +35,11 @@ M10='\033[1;93m'  # bright yellow
 M11='\033[1;94m'  # bright blue
 M12='\033[1;91m'  # bright red
 TITLE='\033[1;36m'
-PROMPT='\033[1;35m'
-INFO='\033[1;34m'
+PROMPT='\033[1;96m'  # bright cyan - question text (never red/yellow/green)
+HINT='\033[1;97m'    # bright white - defaults/examples inside a question
+INFO='\033[1;34m'    # blue - info lines
 
-# message badges: colored background + white text
+# message badges: colored background + white text (errors/status only)
 OK_BG='\033[42m\033[97m'    # green bg
 WARN_BG='\033[43m\033[97m'  # yellow bg
 ERR_BG='\033[41m\033[97m'   # red bg
@@ -50,11 +55,117 @@ CAMO_ROOT="/var/www/goldip"
 # Cloudflare official ranges (fallback if live fetch fails)
 CF_V4_DEFAULT="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22"
 CF_V6_DEFAULT="2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
-# ArvanCloud CDN edge ranges (verify against panel; update if changed).
-ARVAN_RANGES_DEFAULT="185.143.232.0/22 188.229.116.0/22 94.182.182.0/24 2.144.0.0/12 92.114.16.0/20 195.181.169.0/24"
+# ArvanCloud CDN edge ranges - official list from www.arvancloud.ir/en/ips.txt
+# (baked fallback; the script also live-fetches the latest at runtime).
+ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.116.16/30 2.144.3.128/28 37.32.16.0/27 37.32.17.0/27 37.32.18.0/27 37.32.19.0/27 78.157.36.112/28 94.101.182.0/27 94.101.183.0/28"
+ARVAN_V6_DEFAULT=""
 
 CF_V4=""
 CF_V6=""
+ARVAN_V4=""
+ARVAN_V6=""
+
+# ---------------- Input helpers (re-ask on bad input) ----------------
+# ask <var> <question> [white-hint]            -> required, non-empty
+ask() {
+    local __var="$1" __q="$2" __hint="${3:-}" __ans
+    while true; do
+        if [ -n "$__hint" ]; then
+            echo -e "${PROMPT}${__q} ${HINT}${__hint}${PROMPT}:${RESET}"
+        else
+            echo -e "${PROMPT}${__q}:${RESET}"
+        fi
+        read -r __ans
+        [ -n "$__ans" ] && { printf -v "$__var" '%s' "$__ans"; return 0; }
+        warn "This field can't be empty. Please try again."
+    done
+}
+
+# ask_optional <var> <question> [white-hint]   -> blank allowed
+ask_optional() {
+    local __var="$1" __q="$2" __hint="${3:-}" __ans
+    if [ -n "$__hint" ]; then
+        echo -e "${PROMPT}${__q} ${HINT}${__hint}${PROMPT}:${RESET}"
+    else
+        echo -e "${PROMPT}${__q}:${RESET}"
+    fi
+    read -r __ans
+    printf -v "$__var" '%s' "$__ans"
+}
+
+# ask_number <var> <question> [white-hint]     -> required integer
+ask_number() {
+    local __var="$1" __q="$2" __hint="${3:-}" __ans
+    while true; do
+        if [ -n "$__hint" ]; then
+            echo -e "${PROMPT}${__q} ${HINT}${__hint}${PROMPT}:${RESET}"
+        else
+            echo -e "${PROMPT}${__q}:${RESET}"
+        fi
+        read -r __ans
+        case "$__ans" in
+            ''|*[!0-9]*) warn "Must be a number. Please try again."; continue ;;
+        esac
+        printf -v "$__var" '%s' "$__ans"; return 0
+    done
+}
+
+# ask_port <var> <question> <default>          -> integer 1-65535, default on blank
+ask_port() {
+    local __var="$1" __q="$2" __def="$3" __ans
+    while true; do
+        echo -e "${PROMPT}${__q} ${HINT}[${__def}]${PROMPT}:${RESET}"
+        read -r __ans
+        [ -n "$__ans" ] || __ans="$__def"
+        case "$__ans" in
+            ''|*[!0-9]*) warn "Port must be a number. Please try again."; continue ;;
+        esac
+        if [ "$__ans" -lt 1 ] || [ "$__ans" -gt 65535 ]; then
+            warn "Port out of range (1-65535). Please try again."; continue
+        fi
+        printf -v "$__var" '%s' "$__ans"; return 0
+    done
+}
+
+# ask_port_optional <var> <question>           -> integer or blank
+ask_port_optional() {
+    local __var="$1" __q="$2" __ans
+    while true; do
+        echo -e "${PROMPT}${__q} ${HINT}(blank to skip)${PROMPT}:${RESET}"
+        read -r __ans
+        [ -z "$__ans" ] && { printf -v "$__var" '%s' ""; return 0; }
+        case "$__ans" in *[!0-9]*) warn "Port must be a number. Please try again."; continue ;; esac
+        printf -v "$__var" '%s' "$__ans"; return 0
+    done
+}
+
+# ask_file <var> <question>                    -> existing file, re-asks
+ask_file() {
+    local __var="$1" __q="$2" __ans
+    while true; do
+        echo -e "${PROMPT}${__q}:${RESET}"
+        read -r __ans
+        if [ -z "$__ans" ]; then warn "Path can't be empty. Please try again."; continue; fi
+        if [ ! -f "$__ans" ]; then err "File not found: $__ans"; warn "Please try again."; continue; fi
+        printf -v "$__var" '%s' "$__ans"; return 0
+    done
+}
+
+# ask_choice <var> <question> <valid|regex>    -> e.g. "1|2|3"
+ask_choice() {
+    local __var="$1" __q="$2" __valid="$3" __ans
+    while true; do
+        echo -e "${PROMPT}${__q} ${HINT}[${__valid//|//}]${PROMPT}:${RESET}"
+        read -r __ans
+        if printf '%s' "$__ans" | grep -qiE "^(${__valid})$"; then
+            printf -v "$__var" '%s' "$__ans"; return 0
+        fi
+        warn "Invalid choice. Allowed: ${__valid//|/, }. Please try again."
+    done
+}
+
+# yes/no helper -> returns 0 for yes
+is_yes() { case "$1" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
 
 # ---------------- Header ----------------
 header() {
@@ -76,6 +187,26 @@ require_root() {
         err "Run this script as root."
         exit 1
     fi
+}
+
+# ---------------- Ensure sqlite3 ----------------
+ensure_sqlite3() {
+    command -v sqlite3 >/dev/null 2>&1 && return 0
+    warn "sqlite3 not found. Installing..."
+    if ls ./sqlite-offline/*.deb >/dev/null 2>&1; then
+        dpkg -i ./sqlite-offline/*.deb >/dev/null 2>&1
+        apt-get install -f -y >/dev/null 2>&1
+    else
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y sqlite3 >/dev/null 2>&1
+    fi
+    if command -v sqlite3 >/dev/null 2>&1; then
+        ok "sqlite3 installed."
+        return 0
+    fi
+    warn "Could not install sqlite3 (auto-build from x-ui DB will be unavailable)."
+    warn "Offline: place sqlite3 .deb in ./sqlite-offline/ next to this script."
+    return 1
 }
 
 # ---------------- Install Nginx ----------------
@@ -133,54 +264,43 @@ free_port() {
 }
 
 # ---------------- Fully automatic: build locations from x-ui DB ----------------
-# Lists all inbounds numbered, lets user pick which go behind Nginx.
-# Selected -> listen 127.0.0.1, TLS off, location built. Unselected -> untouched.
-# Sets global LOCATIONS. Returns 0 on success (>=1 selected & built), 1 otherwise.
 auto_build_locations() {
     local db=""
     for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do
         [ -f "$c" ] && db="$c" && break
     done
     if [ -z "$db" ]; then
-        echo -e "${PROMPT}x-ui.db not found. Enter full path (blank to cancel):${RESET}"
-        read -r db
+        ask_optional db "x-ui.db not found. Enter full path" "(blank to cancel)"
         { [ -n "$db" ] && [ -f "$db" ]; } || { warn "No database found."; return 1; }
     fi
-    if ! command -v sqlite3 >/dev/null 2>&1; then
-        warn "sqlite3 not installed - cannot auto-build."
-        warn "Install: apt-get install -y sqlite3   (or place .deb in ./sqlite-offline/)"
-        return 1
-    fi
+    ensure_sqlite3 || return 1
 
     ok "Reading inbounds from: $db"
 
-    # Read all inbounds into parallel arrays
-    local -a IN_PORT IN_NET IN_PATH
+    local -a IN_PORT IN_NET IN_PATH IN_SS
     local idx=0 port ss net rawpath path
     while IFS='|' read -r port ss; do
         [ -n "$port" ] || continue
         case "$port" in *[!0-9]*) continue ;; esac
         net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         rawpath=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
-        path=${rawpath%%\?*}   # strip query string for Nginx location
+        path=${rawpath%%\?*}
         idx=$((idx+1))
         IN_PORT[$idx]="$port"
         IN_NET[$idx]="${net:-unknown}"
         IN_PATH[$idx]="$path"
+        IN_SS[$idx]="$ss"
     done < <(sqlite3 -separator '|' "$db" "SELECT port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
 
     [ "$idx" -ge 1 ] || { warn "No inbounds found in database."; return 1; }
 
-    # Numbered list
     echo -e "${INFO}Inbounds found:${RESET}"
     local n
     for n in $(seq 1 "$idx"); do
         echo -e "  ${M8}${n})${RESET} ${M4}port ${IN_PORT[$n]}${RESET} | ${M5}${IN_NET[$n]}${RESET} | ${M1}${IN_PATH[$n]:-(no path)}${RESET}"
     done
-    echo -e "${PROMPT}Which inbounds go BEHIND Nginx? (comma-separated, e.g. 1,3,4)${RESET}"
     echo -e "${INFO}Leave tunnel inbounds OUT - they stay direct on 0.0.0.0 and are not touched.${RESET}"
-    read -r SEL
-    [ -n "$SEL" ] || { warn "Nothing selected."; return 1; }
+    ask SEL "Which inbounds go BEHIND Nginx?" "(comma-separated, e.g. 1,3,4)"
 
     LOCATIONS=""
     local added=0 skipped=0
@@ -215,6 +335,13 @@ auto_build_locations() {
         esac
         SEEN_PATHS="${SEEN_PATHS} ${path}"
 
+        # externalProxy/dial settings break nginx-fronting (cause 502). Warn loudly.
+        if printf '%s' "${IN_SS[$sel]}" | grep -q '"externalProxy"'; then
+            warn "Inbound #${sel} (port ${port}) has an 'External Proxy' setting."
+            warn "This makes it expect a direct TLS dial and returns 502 behind Nginx."
+            warn "Open this inbound in the x-ui panel, remove External Proxy, set Security=none, save."
+        fi
+
         fport="$port"
         if [ "$port" = "$HTTPS_PORT" ] || [ "$port" = "$HTTP_PORT" ]; then
             fport=$(free_port) || { err "No free local port available."; return 1; }
@@ -236,13 +363,12 @@ $(make_location "$ltype" "$path" "$fport")"
     echo -e "${INFO}Selected: ${added} added, ${skipped} skipped. Unselected inbounds untouched.${RESET}"
     [ "$added" -ge 1 ] || return 1
 
-    # Apply listen=127.0.0.1 + TLS off to the database for selected inbounds
     if [ -n "$SQL_UPDATES" ]; then
         echo -e "${WARN_BG} ACTION ${RESET} Apply listen=127.0.0.1 (and TLS off) to the SELECTED inbounds now?"
         warn "A backup is made first, then x-ui restarts. Unselected (tunnel) inbounds are NOT changed."
-        echo -e "${PROMPT}Apply now? [y/N]:${RESET}"
-        read -r AP
-        if [ "$AP" = "y" ] || [ "$AP" = "Y" ]; then
+        local AP
+        ask_optional AP "Apply now?" "[y/N]"
+        if is_yes "$AP"; then
             local bak
             bak="${db}.bak.$(date +%s)"
             cp "$db" "$bak" && ok "DB backed up: $bak" || { err "Backup failed - aborting DB change."; return 0; }
@@ -268,72 +394,48 @@ $(make_location "$ltype" "$path" "$fport")"
 
 # ---------------- Gather inputs ----------------
 gather_inputs() {
-    echo -e "${PROMPT}Domain (e.g. en.goldip.me):${RESET}"
-    read -r DOMAIN
-    [ -n "$DOMAIN" ] || { err "Domain required."; exit 1; }
-    # allow multiple domains: accept comma or space, normalize to spaces
+    ask DOMAIN "Domain" "(e.g. en.goldip.me - space/comma separates multiple)"
     DOMAIN=$(printf '%s' "$DOMAIN" | tr ',' ' ' | tr -s ' ' | sed -E 's/^ +| +$//g')
     PRIMARY=$(printf '%s' "$DOMAIN" | awk '{print $1}')
 
-    echo -e "${PROMPT}HTTPS listen port [443]:${RESET}"
-    read -r HTTPS_PORT; HTTPS_PORT=${HTTPS_PORT:-443}
+    ask_port HTTPS_PORT "HTTPS listen port" 443
+    ask_port HTTP_PORT  "HTTP listen port"  80
 
-    echo -e "${PROMPT}HTTP listen port [80]:${RESET}"
-    read -r HTTP_PORT; HTTP_PORT=${HTTP_PORT:-80}
+    ask_file SSL_CERT "Full path to SSL certificate (cert.pem / fullchain.pem)"
+    ask_file SSL_KEY  "Full path to SSL private key (key.pem / privkey.pem)"
 
-    echo -e "${PROMPT}Full path to SSL certificate (cert.pem):${RESET}"
-    read -r SSL_CERT
-    [ -f "$SSL_CERT" ] || { err "Cert not found: $SSL_CERT"; exit 1; }
+    ask_optional BEHIND_CF "Is this server behind Cloudflare CDN? (restore real visitor IP)" "[y/N]"
 
-    echo -e "${PROMPT}Full path to SSL private key (key.pem):${RESET}"
-    read -r SSL_KEY
-    [ -f "$SSL_KEY" ] || { err "Key not found: $SSL_KEY"; exit 1; }
-
-    # Behind Cloudflare? restore real client IP
-    echo -e "${PROMPT}Is this server behind Cloudflare CDN? (restore real visitor IP) [y/N]:${RESET}"
-    read -r BEHIND_CF
-
-    # ---- Inbounds ----
     LOCATIONS=""
     echo -e "${INFO}Inbound configuration:${RESET}"
     echo -e "  ${M1}1)${RESET} ${M4}Fully automatic (read & configure from x-ui database)${RESET}"
     echo -e "  ${M2}2)${RESET} ${M5}Manual entry${RESET}"
-    echo -e "${PROMPT}Selection [1/2]:${RESET}"
-    read -r DISC
+    ask_choice DISC "Selection" "1|2"
 
     if [ "$DISC" = "1" ] && auto_build_locations; then
         ok "Locations built automatically from database."
     else
         [ "$DISC" = "1" ] && warn "Auto-build unavailable - switching to manual entry."
-        echo -e "${PROMPT}How many inbounds to add to Nginx?${RESET}"
-        read -r NIN
-        case "$NIN" in ''|*[!0-9]*) err "Must be a number."; exit 1 ;; esac
+        ask_number NIN "How many inbounds to add to Nginx?"
 
         local i=1
         while [ "$i" -le "$NIN" ]; do
             echo -e "${INFO}--- Inbound #${i} ---${RESET}"
-            echo -e "${PROMPT}Path (e.g. /ws${i}):${RESET}"
-            read -r P_PATH
-            [ -n "$P_PATH" ] || { err "Path required."; exit 1; }
+            ask P_PATH "Path" "(e.g. /ws${i})"
             [ "${P_PATH:0:1}" = "/" ] || P_PATH="/$P_PATH"
-
-            echo -e "${PROMPT}Local Xray port (127.0.0.1:PORT):${RESET}"
-            read -r P_PORT
-            case "$P_PORT" in ''|*[!0-9]*) err "Port must be a number."; exit 1 ;; esac
+            ask_number P_PORT "Local Xray port (127.0.0.1:PORT)"
 
             echo -e "${INFO}Transport type:${RESET}"
             echo -e "  ${M1}1)${RESET} ${M4}WebSocket (ws)${RESET}"
             echo -e "  ${M2}2)${RESET} ${M5}HTTPUpgrade${RESET}"
             echo -e "  ${M3}3)${RESET} ${M7}XHTTP (splithttp)${RESET}"
-            echo -e "${PROMPT}Selection [1/2/3]:${RESET}"
-            read -r P_TYPE
+            ask_choice P_TYPE "Selection" "1|2|3"
 
             case "$P_TYPE" in
                 1|2) LOCATIONS="${LOCATIONS}
 $(make_location upgrade "$P_PATH" "$P_PORT")" ;;
                 3)   LOCATIONS="${LOCATIONS}
 $(make_location xhttp "$P_PATH" "$P_PORT")" ;;
-                *)   err "Invalid transport type."; exit 1 ;;
             esac
             i=$((i + 1))
         done
@@ -342,43 +444,34 @@ $(make_location xhttp "$P_PATH" "$P_PORT")" ;;
     echo -e "${INFO}Camouflage site type:${RESET}"
     echo -e "  ${M1}1)${RESET} ${M4}Reverse-proxy to an existing website${RESET}"
     echo -e "  ${M2}2)${RESET} ${M5}Serve a local HTML file${RESET}"
-    echo -e "${PROMPT}Selection [1/2]:${RESET}"
-    read -r CAMO
+    ask_choice CAMO "Selection" "1|2"
 
     if [ "$CAMO" = "1" ]; then
-        echo -e "${PROMPT}Website URL to proxy (e.g. https://example.com):${RESET}"
-        read -r PROXY_URL
-        [ -n "$PROXY_URL" ] || { err "URL required."; exit 1; }
-        PROXY_HOST=$(echo "$PROXY_URL" | sed -E 's#^https?://##; s#/.*##')
+        ask PROXY_URL "Website URL to proxy" "(e.g. https://example.com - avoid sites with bot protection)"
+        PROXY_HOST=$(printf '%s' "$PROXY_URL" | sed -E 's#^https?://##; s#/.*##')
         CAMO_BLOCK="location / {
         proxy_pass ${PROXY_URL};
         proxy_set_header Host ${PROXY_HOST};
         proxy_ssl_server_name on;
     }"
-    elif [ "$CAMO" = "2" ]; then
-        echo -e "${PROMPT}Full path to your index.html:${RESET}"
-        read -r HTML_FILE
-        [ -f "$HTML_FILE" ] || { err "HTML file not found: $HTML_FILE"; exit 1; }
+    else
+        ask_file HTML_FILE "Full path to your index.html"
         mkdir -p "$CAMO_ROOT"
         cp "$HTML_FILE" "$CAMO_ROOT/index.html"
         CAMO_BLOCK="location / {
         root ${CAMO_ROOT};
         index index.html;
     }"
-    else
-        err "Invalid selection."; exit 1
     fi
 }
 
 # ---------------- Write config ----------------
 write_config() {
     mkdir -p "$NGINX_CONF_DIR"
-    # remove default site to avoid port conflicts
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null
     rm -f /etc/nginx/conf.d/default.conf 2>/dev/null
 
-    # Optional: restore real visitor IP when behind Cloudflare
-    if [ "${BEHIND_CF:-}" = "y" ] || [ "${BEHIND_CF:-}" = "Y" ]; then
+    if is_yes "${BEHIND_CF:-}"; then
         write_cf_realip
     fi
 
@@ -417,15 +510,16 @@ EOF
     else
         err "Config test failed:"
         cat /tmp/nginx_test.log
-        exit 1
+        warn "Fix the reported line and run install again (your inputs were not lost server-side)."
+        return 1
     fi
 }
 
 do_install() {
     install_nginx
+    ensure_sqlite3
     gather_inputs
-    write_config
-    # Make everything survive reboots automatically (no watchdog prompt here)
+    write_config || return 1
     enable_persistence silent
 }
 
@@ -466,7 +560,6 @@ show_status() {
 }
 
 # ---------------- Color-coded logs ----------------
-# Colorizes one nginx ERROR-log line.
 colorize_error_line() {
     local line="$1"
     if printf '%s' "$line" | grep -qiE '\[(error|crit|alert|emerg)\]'; then
@@ -480,10 +573,8 @@ colorize_error_line() {
     fi
 }
 
-# Colorizes one nginx ACCESS-log line by HTTP status code.
 colorize_access_line() {
     local line="$1" code
-    # status = first 3-digit number right after the quoted request: ..."GET / HTTP/1.1" 200 ...
     code=$(printf '%s' "$line" | grep -oE '" [1-5][0-9][0-9] ' | head -n1 | tr -dc '0-9')
     [ -n "$code" ] || code=$(printf '%s' "$line" | grep -oE ' [1-5][0-9][0-9] ' | head -n1 | tr -dc '0-9')
     case "$code" in
@@ -496,7 +587,6 @@ colorize_access_line() {
 }
 
 view_logs() {
-    # Discover available nginx logs so the user always picks a populated one.
     local logdir="/var/log/nginx"
     if [ ! -d "$logdir" ]; then
         err "No nginx log directory at $logdir"
@@ -522,14 +612,11 @@ view_logs() {
         size=$(du -h "${LOGS[$n]}" 2>/dev/null | awk '{print $1}')
         echo -e "  ${M8}${n})${RESET} ${M4}${LOGS[$n]}${RESET} ${M5}(${size:-0})${RESET}"
     done
-    echo -e "${PROMPT}Pick a log number to view (or 'f' to live-follow it):${RESET}"
-    read -r PICK
 
-    local follow=0
+    local PICK follow=0
+    ask PICK "Pick a log number to view" "(or 'f' then a number to live-follow)"
     case "$PICK" in
-        f|F) follow=1
-             echo -e "${PROMPT}Which number to follow?${RESET}"
-             read -r PICK ;;
+        f|F) follow=1; ask_number PICK "Which number to follow?" ;;
     esac
     case "$PICK" in ''|*[!0-9]*) err "Invalid choice."; return ;; esac
     if [ "$PICK" -lt 1 ] || [ "$PICK" -gt "$i" ]; then
@@ -584,24 +671,61 @@ fetch_cloudflare_ranges() {
     fi
 }
 
-write_cf_realip() {
-    [ -n "$CF_V4" ] || fetch_cloudflare_ranges
-    local f="${NGINX_CONF_DIR}/00-cloudflare-realip.conf"
+fetch_arvan_ranges() {
+    local v4="" url
+    for url in https://www.arvancloud.ir/en/ips.txt https://www.arvancloud.ir/fa/ips.txt; do
+        if command -v curl >/dev/null 2>&1; then
+            v4=$(curl -fsSL --max-time 12 -A "Mozilla/5.0" "$url" 2>/dev/null | tr -d '\r')
+        elif command -v wget >/dev/null 2>&1; then
+            v4=$(wget -qO- --timeout=12 -U "Mozilla/5.0" "$url" 2>/dev/null | tr -d '\r')
+        fi
+        printf '%s' "$v4" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' && break
+    done
+    # keep only v4 (optionally /CIDR) entries, join with spaces
+    v4=$(printf '%s\n' "$v4" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u | tr '\n' ' ')
+    if printf '%s' "$v4" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
+        # add /32 to bare IPs so ufw accepts them uniformly
+        ARVAN_V4=$(for x in $v4; do case "$x" in */*) echo "$x" ;; *) echo "$x/32" ;; esac; done | tr '\n' ' ')
+        ok "Fetched live ArvanCloud ranges ($(printf '%s' "$ARVAN_V4" | wc -w) entries)."
+    else
+        ARVAN_V4="$ARVAN_V4_DEFAULT"
+        warn "Live fetch failed - using built-in ArvanCloud ranges."
+    fi
+    ARVAN_V6="$ARVAN_V6_DEFAULT"
+}
+
+# write_realip <provider>  (provider = cloudflare | arvan)
+write_realip() {
+    local provider="$1" f hdr ranges4 ranges6
+    case "$provider" in
+        cloudflare)
+            [ -n "$CF_V4" ] || fetch_cloudflare_ranges
+            f="${NGINX_CONF_DIR}/00-cloudflare-realip.conf"
+            hdr="CF-Connecting-IP"; ranges4="$CF_V4"; ranges6="$CF_V6" ;;
+        arvan)
+            [ -n "$ARVAN_V4" ] || fetch_arvan_ranges
+            f="${NGINX_CONF_DIR}/00-arvan-realip.conf"
+            hdr="X-Forwarded-For"; ranges4="$ARVAN_V4"; ranges6="$ARVAN_V6" ;;
+        *) return 1 ;;
+    esac
     {
-        echo "# Restore real client IP from Cloudflare (auto-generated by GoldIP)"
-        for c in $CF_V4; do echo "set_real_ip_from $c;"; done
-        for c in $CF_V6; do echo "set_real_ip_from $c;"; done
-        echo "real_ip_header CF-Connecting-IP;"
+        echo "# Restore real client IP from ${provider} (auto-generated by GoldIP)"
+        for c in $ranges4; do echo "set_real_ip_from $c;"; done
+        for c in $ranges6; do echo "set_real_ip_from $c;"; done
+        echo "real_ip_header ${hdr};"
         echo "real_ip_recursive on;"
     } > "$f"
     if nginx -t 2>/tmp/nginx_test.log; then
-        ok "Cloudflare real-IP restore enabled ($f)."
+        ok "${provider} real-IP restore enabled ($f)."
     else
         warn "real-IP config rejected by nginx - removing it."
         rm -f "$f"
         cat /tmp/nginx_test.log
     fi
 }
+
+# Backward-compatible wrapper (used by the install-time BEHIND_CF prompt)
+write_cf_realip() { write_realip cloudflare; }
 
 # ---------------- Firewall ----------------
 setup_firewall() {
@@ -620,43 +744,31 @@ setup_firewall() {
     echo -e "  ${M2}2)${RESET} ${M5}ArvanCloud${RESET}"
     echo -e "  ${M3}3)${RESET} ${M7}Both (Cloudflare + ArvanCloud)${RESET}"
     echo -e "  ${M8}4)${RESET} ${M8}Custom CIDRs${RESET}"
-    echo -e "${PROMPT}Selection [1/2/3/4]:${RESET}"
-    read -r CDN_CHOICE
+    local CDN_CHOICE
+    ask_choice CDN_CHOICE "Selection" "1|2|3|4"
 
     local RANGES="" RANGES6=""
     case "$CDN_CHOICE" in
         1)  fetch_cloudflare_ranges
             RANGES="$CF_V4"; RANGES6="$CF_V6" ;;
-        2)  RANGES="$ARVAN_RANGES_DEFAULT" ;;
-        3)  fetch_cloudflare_ranges
-            RANGES="$CF_V4 $ARVAN_RANGES_DEFAULT"; RANGES6="$CF_V6" ;;
-        4)  echo -e "${PROMPT}Paste space-separated IPv4 CIDRs:${RESET}"
-            read -r RANGES
-            echo -e "${PROMPT}Paste space-separated IPv6 CIDRs (blank for none):${RESET}"
-            read -r RANGES6 ;;
-        *)  warn "No valid CDN choice - defaulting to Cloudflare."
-            fetch_cloudflare_ranges
-            RANGES="$CF_V4"; RANGES6="$CF_V6" ;;
+        2)  fetch_arvan_ranges
+            RANGES="$ARVAN_V4"; RANGES6="$ARVAN_V6" ;;
+        3)  fetch_cloudflare_ranges; fetch_arvan_ranges
+            RANGES="$CF_V4 $ARVAN_V4"; RANGES6="$CF_V6 $ARVAN_V6" ;;
+        4)  ask RANGES "Paste space-separated IPv4 CIDRs"
+            ask_optional RANGES6 "Paste space-separated IPv6 CIDRs" "(blank for none)" ;;
     esac
     [ -n "$RANGES" ] || { err "No IPv4 ranges resolved - aborting."; return 1; }
 
-    echo -e "${PROMPT}SSH port to keep open [22]:${RESET}"
-    read -r SSH_PORT; SSH_PORT=${SSH_PORT:-22}
-
-    echo -e "${PROMPT}HTTPS port to expose to CDN [443]:${RESET}"
-    read -r FW_HTTPS; FW_HTTPS=${FW_HTTPS:-443}
-
-    echo -e "${PROMPT}HTTP port to expose to CDN [80]:${RESET}"
-    read -r FW_HTTP; FW_HTTP=${FW_HTTP:-80}
-
-    echo -e "${PROMPT}Tunnel port (e.g. 8443) - blank to skip:${RESET}"
-    read -r TUN_PORT
+    local SSH_PORT FW_HTTPS FW_HTTP TUN_PORT FOREIGN_IP=""
+    ask_port SSH_PORT "SSH port to keep open" 22
+    ask_port FW_HTTPS "HTTPS port to expose to CDN" 443
+    ask_port FW_HTTP  "HTTP port to expose to CDN"  80
+    ask_port_optional TUN_PORT "Tunnel port (e.g. 8443)"
     if [ -n "$TUN_PORT" ]; then
-        echo -e "${PROMPT}Foreign server IP allowed on tunnel port (blank = any):${RESET}"
-        read -r FOREIGN_IP
+        ask_optional FOREIGN_IP "Foreign server IP allowed on tunnel port" "(blank = any)"
     fi
 
-    # Ensure ufw handles IPv6 if we have v6 ranges
     if [ -n "$RANGES6" ] && [ -f /etc/default/ufw ]; then
         sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw 2>/dev/null
     fi
@@ -666,26 +778,22 @@ setup_firewall() {
     ufw default deny incoming >/dev/null 2>&1
     ufw default allow outgoing >/dev/null 2>&1
 
-    # SSH first - never lock yourself out
     ufw allow "${SSH_PORT}/tcp" >/dev/null 2>&1
     ok "Allowed SSH on ${SSH_PORT}/tcp"
 
-    # Web ports only from CDN ranges (IPv4)
     local cidr
     for cidr in $RANGES; do
         ufw allow from "$cidr" to any port "$FW_HTTPS" proto tcp >/dev/null 2>&1
         ufw allow from "$cidr" to any port "$FW_HTTP"  proto tcp >/dev/null 2>&1
     done
-    # Web ports from CDN ranges (IPv6)
     for cidr in $RANGES6; do
         ufw allow from "$cidr" to any port "$FW_HTTPS" proto tcp >/dev/null 2>&1
         ufw allow from "$cidr" to any port "$FW_HTTP"  proto tcp >/dev/null 2>&1
     done
     ok "Allowed ${FW_HTTPS},${FW_HTTP} only from selected CDN ranges."
 
-    # Tunnel port
     if [ -n "$TUN_PORT" ]; then
-        if [ -n "${FOREIGN_IP:-}" ]; then
+        if [ -n "$FOREIGN_IP" ]; then
             ufw allow from "$FOREIGN_IP" to any port "$TUN_PORT" proto tcp >/dev/null 2>&1
             ok "Allowed tunnel ${TUN_PORT} only from ${FOREIGN_IP}"
         else
@@ -697,17 +805,22 @@ setup_firewall() {
     ufw --force enable >/dev/null 2>&1
     ok "Firewall enabled."
 
-    # Offer Cloudflare real-IP restore when CF is in the mix
+    if command -v nginx >/dev/null 2>&1; then
+        local RIP
+        case "$CDN_CHOICE" in
+            1)  ask_optional RIP "Also restore real visitor IPs from Cloudflare in nginx?" "[y/N]"
+                is_yes "$RIP" && { write_realip cloudflare; systemctl reload nginx 2>/dev/null && ok "Nginx reloaded." || warn "Could not reload nginx."; } ;;
+            2)  ask_optional RIP "Also restore real visitor IPs from ArvanCloud in nginx?" "[y/N]"
+                is_yes "$RIP" && { write_realip arvan; systemctl reload nginx 2>/dev/null && ok "Nginx reloaded." || warn "Could not reload nginx."; } ;;
+            3)  ask_optional RIP "Also restore real visitor IPs in nginx? (pick the CDN that proxies clients)" "[c=Cloudflare / a=Arvan / blank=skip]"
+                case "$RIP" in
+                    c|C) write_realip cloudflare; systemctl reload nginx 2>/dev/null && ok "Nginx reloaded." || warn "Could not reload nginx." ;;
+                    a|A) write_realip arvan;      systemctl reload nginx 2>/dev/null && ok "Nginx reloaded." || warn "Could not reload nginx." ;;
+                esac ;;
+        esac
+    fi
+
     if [ "$CDN_CHOICE" = "1" ] || [ "$CDN_CHOICE" = "3" ]; then
-        if command -v nginx >/dev/null 2>&1; then
-            echo -e "${PROMPT}Also restore real visitor IPs from Cloudflare in nginx? [y/N]:${RESET}"
-            read -r RIP
-            if [ "$RIP" = "y" ] || [ "$RIP" = "Y" ]; then
-                write_cf_realip
-                systemctl reload nginx 2>/dev/null && ok "Nginx reloaded with real-IP." \
-                    || warn "Could not reload nginx."
-            fi
-        fi
         warn "Cloudflare proxy (orange cloud) only forwards standard ports."
         warn "HTTPS must be one of: 443, 2053, 2083, 2087, 2096, 8443."
         warn "Set Cloudflare SSL mode to 'Full' (not Flexible) to avoid redirect loops."
@@ -771,7 +884,6 @@ EOF
 enable_persistence() {
     local mode="${1:-}"
 
-    # ---- Nginx ----
     if command -v nginx >/dev/null 2>&1; then
         systemctl enable nginx >/dev/null 2>&1 && ok "Nginx enabled on boot." \
             || warn "Could not enable nginx."
@@ -794,7 +906,6 @@ EOF
         warn "Nginx not installed; skipping nginx persistence."
     fi
 
-    # ---- x-ui (3x-ui) ----
     if systemctl list-unit-files 2>/dev/null | grep -q '^x-ui\.service'; then
         systemctl enable x-ui >/dev/null 2>&1 && ok "x-ui enabled on boot." \
             || warn "Could not enable x-ui."
@@ -820,17 +931,16 @@ EOF
         if systemctl list-unit-files 2>/dev/null | grep -q '^goldip-watchdog\.timer'; then
             ok "Watchdog already installed and active."
         else
-            echo -e "${PROMPT}Install 1-minute watchdog to auto-revive nginx/x-ui if they crash? [y/N]:${RESET}"
-            read -r WD
-            { [ "$WD" = "y" ] || [ "$WD" = "Y" ]; } && install_watchdog
+            local WD
+            ask_optional WD "Install 1-minute watchdog to auto-revive nginx/x-ui if they crash?" "[y/N]"
+            is_yes "$WD" && install_watchdog
         fi
     fi
 }
 
 uninstall() {
-    echo -e "${PROMPT}Domain config to remove (e.g. en.goldip.me):${RESET}"
-    read -r D
-    [ -n "$D" ] || { err "Domain required."; return; }
+    local D
+    ask D "Domain config to remove" "(e.g. en.goldip.me)"
     rm -f "${NGINX_CONF_DIR}/${D}.conf"
     nginx -t 2>/dev/null && systemctl reload nginx
     ok "Removed config for ${D}"
@@ -853,8 +963,8 @@ menu() {
         echo -e "  ${M10}10) Firewall status${RESET}"
         echo -e "  ${M12}11) Fix auto-start after reboot (persistence)${RESET}"
         echo -e "  ${M6}0)  Exit${RESET}"
-        echo -e "${PROMPT}Choose:${RESET}"
-        read -r CH
+        local CH
+        ask_optional CH "Choose"
         case "$CH" in
             1) do_install ;;
             2) svc start ;;
@@ -870,7 +980,8 @@ menu() {
             0) exit 0 ;;
             *) err "Invalid choice." ;;
         esac
-        echo -e "${PROMPT}Press Enter to continue...${RESET}"; read -r _
+        local _
+        ask_optional _ "Press Enter to continue..."
     done
 }
 
