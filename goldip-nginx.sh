@@ -263,6 +263,41 @@ free_port() {
     return 1
 }
 
+# ---------------- Safe JSON surgery on one inbound's stream_settings ----------------
+# Args: <stream_settings_json> <domain> <https_port> <set_extproxy:1|0>
+# Prints transformed compact JSON on stdout.
+# Sets security=none, drops tlsSettings/realitySettings (nginx terminates TLS),
+# and (optionally) writes externalProxy so x-ui auto-generates client links
+# pointing at domain:https_port with forceTls=tls. Requires python3.
+transform_inbound_json() {
+    python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import json, sys
+raw, domain, hport, setep = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    ss = json.loads(raw)
+except Exception:
+    sys.exit(2)
+if not isinstance(ss, dict):
+    sys.exit(2)
+# nginx terminates TLS -> the real listener must speak plain http
+ss["security"] = "none"
+for k in ("tlsSettings", "realitySettings", "externalProxySettings", "externalProxy"):
+    ss.pop(k, None)
+if setep == "1":
+    try:
+        port = int(hport)
+    except ValueError:
+        port = 443
+    ss["externalProxy"] = [{
+        "forceTls": "tls",
+        "dest": domain,
+        "port": port,
+        "remark": ""
+    }]
+json.dump(ss, sys.stdout, separators=(",", ":"), ensure_ascii=False)
+PYEOF
+}
+
 # ---------------- Fully automatic: build locations from x-ui DB ----------------
 auto_build_locations() {
     local db=""
@@ -277,20 +312,22 @@ auto_build_locations() {
 
     ok "Reading inbounds from: $db"
 
-    local -a IN_PORT IN_NET IN_PATH IN_SS
-    local idx=0 port ss net rawpath path
-    while IFS='|' read -r port ss; do
+    local -a IN_ID IN_PORT IN_NET IN_PATH IN_SS
+    local idx=0 id port ss net rawpath path
+    while IFS='|' read -r id port ss; do
         [ -n "$port" ] || continue
+        case "$id" in ''|*[!0-9]*) continue ;; esac
         case "$port" in *[!0-9]*) continue ;; esac
         net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         rawpath=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         path=${rawpath%%\?*}
         idx=$((idx+1))
+        IN_ID[$idx]="$id"
         IN_PORT[$idx]="$port"
         IN_NET[$idx]="${net:-unknown}"
         IN_PATH[$idx]="$path"
         IN_SS[$idx]="$ss"
-    done < <(sqlite3 -separator '|' "$db" "SELECT port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
+    done < <(sqlite3 -separator '|' "$db" "SELECT id, port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
 
     [ "$idx" -ge 1 ] || { warn "No inbounds found in database."; return 1; }
 
@@ -305,10 +342,25 @@ auto_build_locations() {
     LOCATIONS=""
     local added=0 skipped=0
     local SQL_UPDATES=""
-    local TLSOFF="stream_settings=replace(replace(stream_settings,'\"security\": \"tls\"','\"security\": \"none\"'),'\"security\":\"tls\"','\"security\":\"none\"')"
+    local TLSOFF="stream_settings=replace(replace(stream_settings,'\"security\": \"tls\"','\"security\":\"none\"'),'\"security\":\"tls\"','\"security\":\"none\"')"
     USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""
     SEEN_PATHS=""
+
+    # Can we do safe JSON surgery? (needed for clean externalProxy handling)
+    local HAVE_PY=0
+    command -v python3 >/dev/null 2>&1 && HAVE_PY=1
+
+    # Offer to auto-write External Proxy so the panel generates ready-to-share links
+    # (dest=domain, port=HTTPS, forceTls=tls). The real listener stays 127.0.0.1 + security=none.
+    local EP_AUTO=0 EPASK
+    if [ "$HAVE_PY" = "1" ]; then
+        ask_optional EPASK "Auto-set External Proxy on selected inbounds so client links are ready to hand out (dest=${PRIMARY}, port=${HTTPS_PORT}, TLS)?" "[Y/n]"
+        case "$EPASK" in [nN]|[nN][oO]) EP_AUTO=0 ;; *) EP_AUTO=1 ;; esac
+    else
+        warn "python3 not found: External Proxy can't be auto-configured."
+        warn "Falling back to TLS-off only. Set External Proxy manually in the panel if you need pre-filled links."
+    fi
 
     local sel ltype fport
     for sel in $(printf '%s' "$SEL" | tr ',' ' '); do
@@ -335,28 +387,45 @@ auto_build_locations() {
         esac
         SEEN_PATHS="${SEEN_PATHS} ${path}"
 
-        # externalProxy/dial settings break nginx-fronting (cause 502). Warn loudly.
-        if printf '%s' "${IN_SS[$sel]}" | grep -q '"externalProxy"'; then
-            warn "Inbound #${sel} (port ${port}) has an 'External Proxy' setting."
-            warn "This makes it expect a direct TLS dial and returns 502 behind Nginx."
-            warn "Open this inbound in the x-ui panel, remove External Proxy, set Security=none, save."
-        fi
-
+        # Decide the real local listener port (move off 443/80 if it collides with Nginx)
         fport="$port"
         if [ "$port" = "$HTTPS_PORT" ] || [ "$port" = "$HTTP_PORT" ]; then
             fport=$(free_port) || { err "No free local port available."; return 1; }
-            SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, ${TLSOFF} WHERE port=${port};
-"
-            warn "Port ${port} conflicts with Nginx -> moved inbound to 127.0.0.1:${fport}"
-        else
-            SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', ${TLSOFF} WHERE port=${port};
-"
+            warn "Port ${port} conflicts with Nginx -> moving inbound to 127.0.0.1:${fport}"
         fi
         TAKEN_PORTS="${TAKEN_PORTS} ${fport}"
 
+        local id newjson
+        id="${IN_ID[$sel]}"
+        if [ "$HAVE_PY" = "1" ]; then
+            # Safe JSON surgery: security=none, drop tlsSettings, (opt) set externalProxy.
+            if newjson=$(transform_inbound_json "${IN_SS[$sel]}" "$PRIMARY" "$HTTPS_PORT" "$EP_AUTO"); then
+                newjson=${newjson//\'/\'\'}   # escape single quotes for SQL literal
+                SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, stream_settings='${newjson}' WHERE id=${id};
+"
+                if [ "$EP_AUTO" = "1" ]; then
+                    ok "Added #${sel} ${net} -> ${path} (127.0.0.1:${fport}) + External Proxy ${PRIMARY}:${HTTPS_PORT}"
+                else
+                    ok "Added #${sel} ${net} -> ${path} (127.0.0.1:${fport}) TLS off"
+                fi
+            else
+                warn "Could not parse inbound #${sel} JSON -> using TLS-off fallback."
+                SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, ${TLSOFF} WHERE id=${id};
+"
+                ok "Added #${sel} ${net} -> ${path} (127.0.0.1:${fport})"
+            fi
+        else
+            # No python3: best-effort TLS-off via string replace.
+            if printf '%s' "${IN_SS[$sel]}" | grep -q '"externalProxy"'; then
+                warn "Inbound #${sel} keeps its External Proxy; verify dest=${PRIMARY} port=${HTTPS_PORT} forceTls=tls in the panel."
+            fi
+            SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, ${TLSOFF} WHERE id=${id};
+"
+            ok "Added #${sel} ${net} -> ${path} (127.0.0.1:${fport})"
+        fi
+
         LOCATIONS="${LOCATIONS}
 $(make_location "$ltype" "$path" "$fport")"
-        ok "Added #${sel} ${net} -> ${path} (127.0.0.1:${fport})"
         added=$((added+1))
     done
 
@@ -394,7 +463,7 @@ $(make_location "$ltype" "$path" "$fport")"
 
 # ---------------- Gather inputs ----------------
 gather_inputs() {
-    ask DOMAIN "Domain" "(e.g. en.goldip.me - space/comma separates multiple)"
+    ask DOMAIN "Domain" "(e.g. ex.example.com - space/comma separates multiple)"
     DOMAIN=$(printf '%s' "$DOMAIN" | tr ',' ' ' | tr -s ' ' | sed -E 's/^ +| +$//g')
     PRIMARY=$(printf '%s' "$DOMAIN" | awk '{print $1}')
 
