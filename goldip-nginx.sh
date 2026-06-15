@@ -1026,7 +1026,7 @@ menu() {
         echo -e "  ${M4}4)  Restart Nginx${RESET}"
         echo -e "  ${M5}5)  Reload Nginx (apply config)${RESET}"
         echo -e "  ${M7}6)  Status / Monitoring${RESET}"
-        echo -e "  ${M8}7)  View color-coded logs${RESET}"
+        echo -e "  ${M8}7)  View logs${RESET}"
         echo -e "  ${M2}8)  Uninstall a domain config${RESET}"
         echo -e "  ${M11}9)  Setup firewall (CDN + tunnel lockdown)${RESET}"
         echo -e "  ${M10}10) Firewall status${RESET}"
