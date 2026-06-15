@@ -1009,7 +1009,7 @@ EOF
 
 uninstall() {
     local D
-    ask D "Domain config to remove" "(e.g. en.goldip.me)"
+    ask D "Domain config to remove" "(e.g. ex.example.com)"
     rm -f "${NGINX_CONF_DIR}/${D}.conf"
     nginx -t 2>/dev/null && systemctl reload nginx
     ok "Removed config for ${D}"
@@ -1020,7 +1020,7 @@ menu() {
     while true; do
         clear
         echo -e "${TITLE}"; header; echo -e "${RESET}"
-        echo -e "  ${M1}1)  Install / Configure camouflage site${RESET}"
+        echo -e "  ${M1}1)  Install / Config website${RESET}"
         echo -e "  ${M9}2)  Start Nginx${RESET}"
         echo -e "  ${M3}3)  Stop Nginx${RESET}"
         echo -e "  ${M4}4)  Restart Nginx${RESET}"
