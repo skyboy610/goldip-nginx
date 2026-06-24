@@ -15,34 +15,36 @@
 #   - Cloudflare CDN ranges (v4+v6) supported in firewall.
 #   - nginx + x-ui auto-start and self-heal after reboot.
 #   - Color-coded log viewer that auto-discovers logs.
+#   - Fully automatic inbound detection: non-CDN-compatible
+#     inbounds are silently skipped; no manual selection needed.
+#   - External Proxy written with sni, fingerprint, alpn fields
+#     (3x-ui new format).
 # ============================================================
 
 set -uo pipefail
 
 # ---------------- Colors ----------------
 RESET='\033[0m'
-# menu line colors (each unique, never white)
-M1='\033[1;36m'   # cyan
-M2='\033[1;35m'   # magenta
-M3='\033[1;34m'   # blue
-M4='\033[1;32m'   # green
-M5='\033[1;33m'   # yellow
-M6='\033[1;31m'   # red
-M7='\033[1;95m'   # bright magenta
-M8='\033[1;96m'   # bright cyan
-M9='\033[1;92m'   # bright green
-M10='\033[1;93m'  # bright yellow
-M11='\033[1;94m'  # bright blue
-M12='\033[1;91m'  # bright red
+M1='\033[1;36m'
+M2='\033[1;35m'
+M3='\033[1;34m'
+M4='\033[1;32m'
+M5='\033[1;33m'
+M6='\033[1;31m'
+M7='\033[1;95m'
+M8='\033[1;96m'
+M9='\033[1;92m'
+M10='\033[1;93m'
+M11='\033[1;94m'
+M12='\033[1;91m'
 TITLE='\033[1;36m'
-PROMPT='\033[1;96m'  # bright cyan - question text (never red/yellow/green)
-HINT='\033[1;97m'    # bright white - defaults/examples inside a question
-INFO='\033[1;34m'    # blue - info lines
+PROMPT='\033[1;96m'
+HINT='\033[1;97m'
+INFO='\033[1;34m'
 
-# message badges: colored background + white text (errors/status only)
-OK_BG='\033[42m\033[97m'    # green bg
-WARN_BG='\033[43m\033[97m'  # yellow bg
-ERR_BG='\033[41m\033[97m'   # red bg
+OK_BG='\033[42m\033[97m'
+WARN_BG='\033[43m\033[97m'
+ERR_BG='\033[41m\033[97m'
 
 ok()   { echo -e "${OK_BG} OK ${RESET} $1"; }
 warn() { echo -e "${WARN_BG} WARN ${RESET} $1"; }
@@ -52,11 +54,8 @@ NGINX_CONF_DIR="/etc/nginx/conf.d"
 CAMO_ROOT="/var/www/goldip"
 
 # ---------------- CDN IP ranges ----------------
-# Cloudflare official ranges (fallback if live fetch fails)
 CF_V4_DEFAULT="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22"
 CF_V6_DEFAULT="2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
-# ArvanCloud CDN edge ranges - official list from www.arvancloud.ir/en/ips.txt
-# (baked fallback; the script also live-fetches the latest at runtime).
 ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.116.16/30 2.144.3.128/28 37.32.16.0/27 37.32.17.0/27 37.32.18.0/27 37.32.19.0/27 78.157.36.112/28 94.101.182.0/27 94.101.183.0/28"
 ARVAN_V6_DEFAULT=""
 
@@ -65,8 +64,7 @@ CF_V6=""
 ARVAN_V4=""
 ARVAN_V6=""
 
-# ---------------- Input helpers (re-ask on bad input) ----------------
-# ask <var> <question> [white-hint]            -> required, non-empty
+# ---------------- Input helpers ----------------
 ask() {
     local __var="$1" __q="$2" __hint="${3:-}" __ans
     while true; do
@@ -81,7 +79,6 @@ ask() {
     done
 }
 
-# ask_optional <var> <question> [white-hint]   -> blank allowed
 ask_optional() {
     local __var="$1" __q="$2" __hint="${3:-}" __ans
     if [ -n "$__hint" ]; then
@@ -93,7 +90,6 @@ ask_optional() {
     printf -v "$__var" '%s' "$__ans"
 }
 
-# ask_number <var> <question> [white-hint]     -> required integer
 ask_number() {
     local __var="$1" __q="$2" __hint="${3:-}" __ans
     while true; do
@@ -110,7 +106,6 @@ ask_number() {
     done
 }
 
-# ask_port <var> <question> <default>          -> integer 1-65535, default on blank
 ask_port() {
     local __var="$1" __q="$2" __def="$3" __ans
     while true; do
@@ -127,7 +122,6 @@ ask_port() {
     done
 }
 
-# ask_port_optional <var> <question>           -> integer or blank
 ask_port_optional() {
     local __var="$1" __q="$2" __ans
     while true; do
@@ -139,7 +133,6 @@ ask_port_optional() {
     done
 }
 
-# ask_file <var> <question>                    -> existing file, re-asks
 ask_file() {
     local __var="$1" __q="$2" __ans
     while true; do
@@ -151,7 +144,6 @@ ask_file() {
     done
 }
 
-# ask_choice <var> <question> <valid|regex>    -> e.g. "1|2|3"
 ask_choice() {
     local __var="$1" __q="$2" __valid="$3" __ans
     while true; do
@@ -164,7 +156,6 @@ ask_choice() {
     done
 }
 
-# yes/no helper -> returns 0 for yes
 is_yes() { case "$1" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
 
 # ---------------- Header ----------------
@@ -241,7 +232,6 @@ install_nginx() {
 }
 
 # ---------------- Build a location block ----------------
-# args: <type: upgrade|xhttp> <path> <port>
 make_location() {
     local t="$1" p="$2" port="$3"
     if [ "$t" = "xhttp" ]; then
@@ -252,7 +242,6 @@ make_location() {
 }
 
 # ---------------- Find a free local port ----------------
-# Uses globals: USED_PORTS (listening), TAKEN_PORTS (already assigned this run)
 free_port() {
     local p
     for p in $(seq 20000 29999); do
@@ -265,10 +254,7 @@ free_port() {
 
 # ---------------- Safe JSON surgery on one inbound's stream_settings ----------------
 # Args: <stream_settings_json> <domain> <https_port> <set_extproxy:1|0>
-# Prints transformed compact JSON on stdout.
-# Sets security=none, drops tlsSettings/realitySettings (nginx terminates TLS),
-# and (optionally) writes externalProxy so x-ui auto-generates client links
-# pointing at domain:https_port with forceTls=tls. Requires python3.
+# External Proxy format: new 3x-ui format with sni, fingerprint, alpn fields.
 transform_inbound_json() {
     python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
 import json, sys
@@ -288,17 +274,24 @@ if setep == "1":
         port = int(hport)
     except ValueError:
         port = 443
+    # New 3x-ui externalProxy format with sni, fingerprint, alpn
     ss["externalProxy"] = [{
         "forceTls": "tls",
         "dest": domain,
         "port": port,
-        "remark": ""
+        "remark": "",
+        "sni": domain,
+        "fingerprint": "chrome",
+        "alpn": ["http/1.1", "h2"]
     }]
 json.dump(ss, sys.stdout, separators=(",", ":"), ensure_ascii=False)
 PYEOF
 }
 
 # ---------------- Fully automatic: build locations from x-ui DB ----------------
+# All eligible inbounds (ws/httpupgrade/xhttp with unique non-root paths) are
+# automatically included. No number input required from the user.
+# Non-CDN-compatible transports (tcp, kcp, grpc, quic, etc.) are silently skipped.
 auto_build_locations() {
     local db=""
     for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do
@@ -331,63 +324,65 @@ auto_build_locations() {
 
     [ "$idx" -ge 1 ] || { warn "No inbounds found in database."; return 1; }
 
-    echo -e "${INFO}Inbounds found:${RESET}"
+    echo -e "${INFO}Inbounds found in database:${RESET}"
     local n
     for n in $(seq 1 "$idx"); do
-        echo -e "  ${M8}${n})${RESET} ${M4}port ${IN_PORT[$n]}${RESET} | ${M5}${IN_NET[$n]}${RESET} | ${M1}${IN_PATH[$n]:-(no path)}${RESET}"
+        echo -e "  ${M8}•${RESET} ${M4}port ${IN_PORT[$n]}${RESET} | ${M5}${IN_NET[$n]}${RESET} | ${M1}${IN_PATH[$n]:-(no path)}${RESET}"
     done
-    echo -e "${INFO}Leave tunnel inbounds OUT - they stay direct on 0.0.0.0 and are not touched.${RESET}"
-    ask SEL "Which inbounds go BEHIND Nginx?" "(comma-separated, e.g. 1,3,4)"
+    echo -e "${INFO}Auto-selecting all CDN-compatible inbounds (ws/httpupgrade/xhttp with valid paths)...${RESET}"
 
     LOCATIONS=""
-    local added=0 skipped=0
+    local added=0 skipped_transport=0 skipped_path=0 skipped_dup=0
     local SQL_UPDATES=""
     local TLSOFF="stream_settings=replace(replace(stream_settings,'\"security\": \"tls\"','\"security\":\"none\"'),'\"security\":\"tls\"','\"security\":\"none\"')"
     USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""
     SEEN_PATHS=""
 
-    # Can we do safe JSON surgery? (needed for clean externalProxy handling)
     local HAVE_PY=0
     command -v python3 >/dev/null 2>&1 && HAVE_PY=1
 
-    # Offer to auto-write External Proxy so the panel generates ready-to-share links
-    # (dest=domain, port=HTTPS, forceTls=tls). The real listener stays 127.0.0.1 + security=none.
-    local EP_AUTO=0 EPASK
-    if [ "$HAVE_PY" = "1" ]; then
-        ask_optional EPASK "Auto-set External Proxy on selected inbounds so client links are ready to hand out (dest=${PRIMARY}, port=${HTTPS_PORT}, TLS)?" "[Y/n]"
-        case "$EPASK" in [nN]|[nN][oO]) EP_AUTO=0 ;; *) EP_AUTO=1 ;; esac
-    else
+    # Always enable External Proxy in new 3x-ui format (sni+fingerprint+alpn)
+    local EP_AUTO=1
+    if [ "$HAVE_PY" != "1" ]; then
         warn "python3 not found: External Proxy can't be auto-configured."
-        warn "Falling back to TLS-off only. Set External Proxy manually in the panel if you need pre-filled links."
+        warn "Falling back to TLS-off only. Set External Proxy manually in the panel."
+        EP_AUTO=0
     fi
 
-    local sel ltype fport
-    for sel in $(printf '%s' "$SEL" | tr ',' ' '); do
-        case "$sel" in ''|*[!0-9]*) warn "Ignore invalid selection '$sel'."; continue ;; esac
-        if [ "$sel" -lt 1 ] || [ "$sel" -gt "$idx" ]; then
-            warn "Ignore out-of-range selection '$sel'."; continue
-        fi
-        port="${IN_PORT[$sel]}"; net="${IN_NET[$sel]}"; path="${IN_PATH[$sel]}"
+    local ltype fport inb_id
+    for n in $(seq 1 "$idx"); do
+        port="${IN_PORT[$n]}"
+        net="${IN_NET[$n]}"
+        path="${IN_PATH[$n]}"
+        inb_id="${IN_ID[$n]}"
 
+        # Skip non-CDN-compatible transports silently
         case "$net" in
             ws|httpupgrade) ltype="upgrade" ;;
             xhttp|splithttp) ltype="xhttp" ;;
-            *) warn "Skip #${sel} (port ${port}): transport '${net}' can't be proxied via Nginx."
-               skipped=$((skipped+1)); continue ;;
+            *)
+                skipped_transport=$((skipped_transport+1))
+                continue
+                ;;
         esac
 
+        # Skip inbounds without a valid unique path (silently)
         if [ -z "$path" ] || [ "$path" = "/" ]; then
-            warn "Skip #${sel} (port ${port}): path '${path:-empty}' needs a unique non-root value."
-            skipped=$((skipped+1)); continue
+            skipped_path=$((skipped_path+1))
+            continue
         fi
+
+        # Skip duplicate paths silently
         case " $SEEN_PATHS " in
-            *" $path "*) warn "Skip #${sel} (port ${port}): path '${path}' duplicate."
-                         skipped=$((skipped+1)); continue ;;
+            *" $path "*)
+                skipped_dup=$((skipped_dup+1))
+                continue
+                ;;
         esac
         SEEN_PATHS="${SEEN_PATHS} ${path}"
 
-        # Decide the real local listener port (move off 443/80 if it collides with Nginx)
+        # Decide the real local listener port
         fport="$port"
         if [ "$port" = "$HTTPS_PORT" ] || [ "$port" = "$HTTP_PORT" ]; then
             fport=$(free_port) || { err "No free local port available."; return 1; }
@@ -395,33 +390,26 @@ auto_build_locations() {
         fi
         TAKEN_PORTS="${TAKEN_PORTS} ${fport}"
 
-        local id newjson
-        id="${IN_ID[$sel]}"
+        local newjson
         if [ "$HAVE_PY" = "1" ]; then
-            # Safe JSON surgery: security=none, drop tlsSettings, (opt) set externalProxy.
-            if newjson=$(transform_inbound_json "${IN_SS[$sel]}" "$PRIMARY" "$HTTPS_PORT" "$EP_AUTO"); then
-                newjson=${newjson//\'/\'\'}   # escape single quotes for SQL literal
-                SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, stream_settings='${newjson}' WHERE id=${id};
+            if newjson=$(transform_inbound_json "${IN_SS[$n]}" "$PRIMARY" "$HTTPS_PORT" "$EP_AUTO"); then
+                newjson=${newjson//\'/\'\'}
+                SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, stream_settings='${newjson}' WHERE id=${inb_id};
 "
-                if [ "$EP_AUTO" = "1" ]; then
-                    ok "Added #${sel} ${net} -> ${path} (127.0.0.1:${fport}) + External Proxy ${PRIMARY}:${HTTPS_PORT}"
-                else
-                    ok "Added #${sel} ${net} -> ${path} (127.0.0.1:${fport}) TLS off"
-                fi
+                ok "Auto-added: ${net} -> ${path} (127.0.0.1:${fport}) + ExternalProxy ${PRIMARY}:${HTTPS_PORT} [sni/fp/alpn]"
             else
-                warn "Could not parse inbound #${sel} JSON -> using TLS-off fallback."
-                SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, ${TLSOFF} WHERE id=${id};
+                warn "Could not parse inbound JSON for port ${port} -> using TLS-off fallback."
+                SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, ${TLSOFF} WHERE id=${inb_id};
 "
-                ok "Added #${sel} ${net} -> ${path} (127.0.0.1:${fport})"
+                ok "Auto-added: ${net} -> ${path} (127.0.0.1:${fport}) TLS off"
             fi
         else
-            # No python3: best-effort TLS-off via string replace.
-            if printf '%s' "${IN_SS[$sel]}" | grep -q '"externalProxy"'; then
-                warn "Inbound #${sel} keeps its External Proxy; verify dest=${PRIMARY} port=${HTTPS_PORT} forceTls=tls in the panel."
+            if printf '%s' "${IN_SS[$n]}" | grep -q '"externalProxy"'; then
+                warn "Inbound port ${port} keeps its existing External Proxy; verify manually in panel."
             fi
-            SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, ${TLSOFF} WHERE id=${id};
+            SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, ${TLSOFF} WHERE id=${inb_id};
 "
-            ok "Added #${sel} ${net} -> ${path} (127.0.0.1:${fport})"
+            ok "Auto-added: ${net} -> ${path} (127.0.0.1:${fport})"
         fi
 
         LOCATIONS="${LOCATIONS}
@@ -429,12 +417,18 @@ $(make_location "$ltype" "$path" "$fport")"
         added=$((added+1))
     done
 
-    echo -e "${INFO}Selected: ${added} added, ${skipped} skipped. Unselected inbounds untouched.${RESET}"
-    [ "$added" -ge 1 ] || return 1
+    echo ""
+    echo -e "${INFO}Summary: ${M4}${added} added${RESET}${INFO} | skipped: ${skipped_transport} unsupported-transport, ${skipped_path} no-valid-path, ${skipped_dup} duplicate-path${RESET}"
+
+    if [ "$added" -eq 0 ]; then
+        warn "No eligible inbounds found (need ws/httpupgrade/xhttp with a unique non-root path)."
+        return 1
+    fi
 
     if [ -n "$SQL_UPDATES" ]; then
-        echo -e "${WARN_BG} ACTION ${RESET} Apply listen=127.0.0.1 (and TLS off) to the SELECTED inbounds now?"
-        warn "A backup is made first, then x-ui restarts. Unselected (tunnel) inbounds are NOT changed."
+        echo ""
+        echo -e "${WARN_BG} ACTION ${RESET} Apply listen=127.0.0.1 + ExternalProxy to the ${added} selected inbound(s) now?"
+        warn "A backup is made first, then x-ui restarts. Tunnel inbounds not matching criteria are NOT touched."
         local AP
         ask_optional AP "Apply now?" "[y/N]"
         if is_yes "$AP"; then
@@ -518,10 +512,43 @@ $(make_location xhttp "$P_PATH" "$P_PORT")" ;;
     if [ "$CAMO" = "1" ]; then
         ask PROXY_URL "Website URL to proxy" "(e.g. https://example.com - avoid sites with bot protection)"
         PROXY_HOST=$(printf '%s' "$PROXY_URL" | sed -E 's#^https?://##; s#/.*##')
-        CAMO_BLOCK="location / {
+        PROXY_SCHEME=$(printf '%s' "$PROXY_URL" | grep -oE '^https?')
+        CAMO_BLOCK="# -- Camouflage reverse-proxy: keeps browser on our domain --
+    proxy_set_header Accept-Encoding '';
+    sub_filter_once off;
+    sub_filter_types text/html text/css text/javascript application/javascript application/json;
+    sub_filter '${PROXY_SCHEME}://${PROXY_HOST}' '';
+    sub_filter '//${PROXY_HOST}' '';
+
+    location / {
         proxy_pass ${PROXY_URL};
-        proxy_set_header Host ${PROXY_HOST};
         proxy_ssl_server_name on;
+        proxy_set_header Host ${PROXY_HOST};
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Referer '${PROXY_SCHEME}://${PROXY_HOST}';
+        proxy_set_header Accept-Encoding '';
+
+        # Rewrite Location headers in 3xx redirects
+        proxy_redirect ${PROXY_SCHEME}://${PROXY_HOST}/ /;
+        proxy_redirect //${PROXY_HOST}/ /;
+
+        # Rewrite domain in response body (HTML/CSS/JS)
+        sub_filter '${PROXY_SCHEME}://${PROXY_HOST}' '';
+        sub_filter '//${PROXY_HOST}' '';
+        sub_filter_once off;
+
+        # Strip cookie domain so cookies work on our domain
+        proxy_cookie_domain ${PROXY_HOST} \$host;
+        proxy_cookie_path / /;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_buffers 16 16k;
+        proxy_buffer_size 16k;
     }"
     else
         ask_file HTML_FILE "Full path to your index.html"
@@ -544,6 +571,16 @@ write_config() {
         write_cf_realip
     fi
 
+    # Ensure sub_filter module is available (needed for camouflage proxy rewrite)
+    if ! nginx -V 2>&1 | grep -q 'http_sub_module'; then
+        warn "nginx sub_filter module not found. Installing nginx-extras..."
+        if apt-get install -y nginx-extras >/dev/null 2>&1; then
+            ok "nginx-extras installed (includes sub_filter)."
+        else
+            warn "Could not install nginx-extras. URL rewriting in camouflage proxy may not work."
+        fi
+    fi
+
     local conf="${NGINX_CONF_DIR}/${PRIMARY}.conf"
     cat > "$conf" <<EOF
 server {
@@ -560,6 +597,9 @@ server {
     ssl_certificate_key ${SSL_KEY};
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:SSL:10m;
+
+    # Disable gzip on proxied responses so sub_filter can rewrite text content
+    gzip off;
 
     access_log /var/log/nginx/${PRIMARY}.access.log;
     error_log  /var/log/nginx/${PRIMARY}.error.log;
@@ -750,10 +790,8 @@ fetch_arvan_ranges() {
         fi
         printf '%s' "$v4" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' && break
     done
-    # keep only v4 (optionally /CIDR) entries, join with spaces
     v4=$(printf '%s\n' "$v4" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u | tr '\n' ' ')
     if printf '%s' "$v4" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
-        # add /32 to bare IPs so ufw accepts them uniformly
         ARVAN_V4=$(for x in $v4; do case "$x" in */*) echo "$x" ;; *) echo "$x/32" ;; esac; done | tr '\n' ' ')
         ok "Fetched live ArvanCloud ranges ($(printf '%s' "$ARVAN_V4" | wc -w) entries)."
     else
@@ -763,7 +801,6 @@ fetch_arvan_ranges() {
     ARVAN_V6="$ARVAN_V6_DEFAULT"
 }
 
-# write_realip <provider>  (provider = cloudflare | arvan)
 write_realip() {
     local provider="$1" f hdr ranges4 ranges6
     case "$provider" in
@@ -793,7 +830,6 @@ write_realip() {
     fi
 }
 
-# Backward-compatible wrapper (used by the install-time BEHIND_CF prompt)
 write_cf_realip() { write_realip cloudflare; }
 
 # ---------------- Firewall ----------------
@@ -949,7 +985,6 @@ EOF
     warn "To stop it later: systemctl disable --now goldip-watchdog.timer"
 }
 
-# enable_persistence [silent]
 enable_persistence() {
     local mode="${1:-}"
 
