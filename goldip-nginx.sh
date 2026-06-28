@@ -1,13 +1,14 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v3.0
+#  GoldIP Nginx Camouflage Installer & Manager  v3.1
 #  Compatible with 3x-ui >= 3.4.1 (hosts table, no externalProxy)
+#  Fixes: remark from DB, CDN address separation, host insert
 # ============================================================
 set -uo pipefail
 
 RESET='\033[0m'
 
-# ── Message badge colours (green/red reserved for ok/err) ─────────────────
+# ── Message badge colours ──────────────────────────────────────────────────
 OK_BG='\033[42m\033[97m'
 WARN_BG='\033[43m\033[97m'
 ERR_BG='\033[41m\033[97m'
@@ -16,27 +17,26 @@ ok()   { echo -e "${OK_BG} OK ${RESET} \033[1;32m$1\033[0m"; }
 warn() { echo -e "${WARN_BG} WARN ${RESET} \033[1;33m$1\033[0m"; }
 err()  { echo -e "${ERR_BG} ERROR ${RESET} \033[1;31m$1\033[0m"; }
 
-# ── Prompt/label colours ──────────────────────────────────────────────────
+# ── Prompt/label colours ───────────────────────────────────────────────────
 PROMPT='\033[1;96m'
 HINT='\033[1;97m'
 INFO='\033[1;34m'
 TITLE='\033[1;36m'
 
-# ── Menu item colours  (NO green/red) ────────────────────────────────────
-# Each colour is used on exactly ONE line in the menu
-C_ITEM_1='\033[1;36m'    # Cyan          – line 1
-C_ITEM_2='\033[1;35m'    # Magenta        – line 2
-C_ITEM_3='\033[1;34m'    # Blue           – line 3
-C_ITEM_4='\033[1;33m'    # Yellow         – line 4
-C_ITEM_5='\033[1;95m'    # Bright Magenta – line 5
-C_ITEM_6='\033[1;96m'    # Bright Cyan    – line 6
-C_ITEM_7='\033[1;94m'    # Bright Blue    – line 7
-C_ITEM_8='\033[1;91m'    # RED            – line 8 (Remove domain - allowed)
-C_ITEM_9='\033[1;93m'    # Bright Yellow  – line 9
-C_ITEM_10='\033[1;97m'   # White          – line 10
-C_ITEM_11='\033[38;5;214m'  # Orange      – line 11
-C_ITEM_12='\033[1;91m'   # RED            – line 12 (Full uninstall - allowed)
-C_ITEM_0='\033[38;5;245m'   # Grey        – line 0 (Exit)
+# ── Menu item colours (each line unique) ──────────────────────────────────
+C_ITEM_1='\033[1;36m'
+C_ITEM_2='\033[1;35m'
+C_ITEM_3='\033[1;34m'
+C_ITEM_4='\033[1;33m'
+C_ITEM_5='\033[1;95m'
+C_ITEM_6='\033[1;96m'
+C_ITEM_7='\033[1;94m'
+C_ITEM_8='\033[1;91m'
+C_ITEM_9='\033[1;93m'
+C_ITEM_10='\033[1;97m'
+C_ITEM_11='\033[38;5;214m'
+C_ITEM_12='\033[1;91m'
+C_ITEM_0='\033[38;5;245m'
 
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 CAMO_ROOT="/var/www/goldip"
@@ -47,6 +47,10 @@ CF_V6_DEFAULT="2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:
 ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.116.16/30 2.144.3.128/28 37.32.16.0/27 37.32.17.0/27 37.32.18.0/27 37.32.19.0/27 78.157.36.112/28 94.101.182.0/27 94.101.183.0/28"
 ARVAN_V6_DEFAULT=""
 CF_V4=""; CF_V6=""; ARVAN_V4=""; ARVAN_V6=""
+
+# CDN_ADDRESS: آدرسی که در host entries ست میشه (مثل i.goldip.me)
+# با gather_inputs پر میشه
+CDN_ADDRESS=""
 
 # ── Input helpers ──────────────────────────────────────────────────────────
 ask() {
@@ -122,7 +126,7 @@ normalize_url() {
     esac
 }
 
-# ── Header ────────────────────────────────────────────────────────────────
+# ── Header ─────────────────────────────────────────────────────────────────
 header() {
 cat <<'EOF'
 ==========================================================
@@ -131,7 +135,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v3.0
+    N G I N X   C A M O U F L A G E   v3.1
     Compatible with 3x-ui >= 3.4.1 (Hosts API)
 ==========================================================
 EOF
@@ -141,7 +145,7 @@ require_root() {
     [ "$(id -u)" -eq 0 ] || { err "Run this script as root."; exit 1; }
 }
 
-# ── Locate x-ui database ──────────────────────────────────────────────────
+# ── Locate x-ui database ───────────────────────────────────────────────────
 find_xui_db() {
     local c
     for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do
@@ -150,7 +154,7 @@ find_xui_db() {
     return 1
 }
 
-# ── Ensure sqlite3 ───────────────────────────────────────────────────────
+# ── Ensure sqlite3 ────────────────────────────────────────────────────────
 ensure_sqlite3() {
     command -v sqlite3 >/dev/null 2>&1 && return 0
     warn "sqlite3 not found. Installing..."
@@ -165,7 +169,7 @@ ensure_sqlite3() {
     warn "Could not install sqlite3."; return 1
 }
 
-# ── Install Nginx ─────────────────────────────────────────────────────────
+# ── Install Nginx ──────────────────────────────────────────────────────────
 install_nginx() {
     if command -v nginx >/dev/null 2>&1; then
         ok "Nginx already installed ($(nginx -v 2>&1 | sed 's#.*/##'))."; return 0
@@ -183,7 +187,7 @@ install_nginx() {
     fi
 }
 
-# ── Browser-realistic location block ─────────────────────────────────────
+# ── Browser-realistic location block ──────────────────────────────────────
 make_location() {
     local t="$1" p="$2" port="$3"
     if [ "$t" = "xhttp" ]; then
@@ -233,7 +237,7 @@ make_location() {
     fi
 }
 
-# ── Find a free local port ────────────────────────────────────────────────
+# ── Find a free local port ─────────────────────────────────────────────────
 free_port() {
     local p
     for p in $(seq 20000 29999); do
@@ -243,11 +247,7 @@ free_port() {
     done; return 1
 }
 
-# ── Determine ALPN for a given network type ───────────────────────────────
-#    ws / httpupgrade  -> ["http/1.1"]
-#    xhttp / splithttp -> ["http/1.1","h2"]
-#    grpc              -> ["h2"]
-#    fallback          -> ["http/1.1"]
+# ── Determine ALPN for a given network type ────────────────────────────────
 alpn_for_net() {
     local net="$1"
     case "$net" in
@@ -257,28 +257,30 @@ alpn_for_net() {
     esac
 }
 
-# ── Insert a host row via Python (uses sqlite3 module, no CLI needed) ─────
+# ── FIX 1: insert_host_py — override_sni_from_address=1, remark از DB ─────
 #
 #   Usage: insert_host_py DB INB_ID REMARK ADDRESS PORT SNI ALPN_JSON
 #
-#   All seven arguments are positional.
-#   Returns 0 on success, non-zero on failure.
 insert_host_py() {
     python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYEOF'
 import sqlite3, sys, time
 
-db_path   = sys.argv[1]
-inbound_id= int(sys.argv[2])
-remark    = sys.argv[3]
-address   = sys.argv[4]
-port      = int(sys.argv[5])
-sni       = sys.argv[6]
-alpn_json = sys.argv[7]  # e.g. '["http/1.1"]'
-now_ms    = int(time.time() * 1000)
+db_path    = sys.argv[1]
+inbound_id = int(sys.argv[2])
+remark     = sys.argv[3]
+address    = sys.argv[4]
+port       = int(sys.argv[5])
+sni        = sys.argv[6]
+alpn_json  = sys.argv[7]   # e.g. '["http/1.1"]'
+now_ms     = int(time.time() * 1000)
 
 try:
     con = sqlite3.connect(db_path)
     cur = con.cursor()
+
+    # ── حذف host تکراری برای همین inbound_id (اگه قبلاً وجود داشت) ─────
+    cur.execute("DELETE FROM hosts WHERE inbound_id=?", (inbound_id,))
+
     cur.execute("""
         INSERT INTO hosts (
             inbound_id, sort_order, remark, server_description,
@@ -308,7 +310,7 @@ try:
     ))
     con.commit()
     con.close()
-    print(f"OK host inserted for inbound_id={inbound_id} remark={remark} address={address}:{port}")
+    print(f"OK host inserted for inbound_id={inbound_id} remark={remark} address={address}:{port} sni={sni} alpn={alpn_json}")
     sys.exit(0)
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr)
@@ -316,13 +318,13 @@ except Exception as e:
 PYEOF
 }
 
-# ── Strip TLS from stream_settings in the DB (security -> none) ──────────
+# ── Strip TLS from stream_settings in the DB (security -> none) ───────────
 strip_tls_py() {
     python3 - "$1" "$2" <<'PYEOF'
 import sqlite3, json, sys
 
-db_path   = sys.argv[1]
-inbound_id= int(sys.argv[2])
+db_path    = sys.argv[1]
+inbound_id = int(sys.argv[2])
 
 try:
     con = sqlite3.connect(db_path)
@@ -347,7 +349,7 @@ except Exception as e:
 PYEOF
 }
 
-# ── Auto-build locations AND create hosts in DB ────────────────────────────
+# ── FIX 2 & 3: auto_build_locations — remark از DB + CDN_ADDRESS جدا ──────
 auto_build_locations() {
     local db=""
     db=$(find_xui_db)
@@ -358,28 +360,34 @@ auto_build_locations() {
     ensure_sqlite3 || return 1
     ok "Reading inbounds from: $db"
 
-    # ── Check python3 ────────────────────────────────────────────────────
-    local HAVE_PY=0
-    command -v python3 >/dev/null 2>&1 && HAVE_PY=1
-    [ "$HAVE_PY" = "1" ] || { err "python3 is required for host creation. Please install it."; return 1; }
+    command -v python3 >/dev/null 2>&1 || { err "python3 is required. Please install it."; return 1; }
 
-    # ── Read all inbounds ─────────────────────────────────────────────────
-    local -a IN_ID IN_PORT IN_NET IN_PATH IN_SS
-    local idx=0 id port ss net rawpath path
-    while IFS='|' read -r id port ss; do
-        [ -n "$port" ] || continue
+    # ── FIX 2: query شامل remark از جدول inbounds ─────────────────────────
+    # فیلدها: id | port | remark | stream_settings
+    local -a IN_ID IN_PORT IN_NET IN_PATH IN_SS IN_REMARK
+    local idx=0 id port remark_db ss net rawpath path
+
+    while IFS='|' read -r id port remark_db ss; do
+        [ -n "$port" ]   || continue
         case "$id"   in ''|*[!0-9]*) continue ;; esac
         case "$port" in    *[!0-9]*) continue ;; esac
+
         net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 \
               | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         rawpath=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 \
                   | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         path="${rawpath%%\?*}"
+
         idx=$((idx+1))
-        IN_ID[$idx]="$id"; IN_PORT[$idx]="$port"
-        IN_NET[$idx]="${net:-unknown}"; IN_PATH[$idx]="$path"; IN_SS[$idx]="$ss"
+        IN_ID[$idx]="$id"
+        IN_PORT[$idx]="$port"
+        IN_NET[$idx]="${net:-unknown}"
+        IN_PATH[$idx]="$path"
+        IN_SS[$idx]="$ss"
+        # FIX 2: remark واقعی از دیتابیس ذخیره میشه
+        IN_REMARK[$idx]="${remark_db:-$net}"
     done < <(sqlite3 -separator '|' "$db" \
-        "SELECT id, port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" \
+        "SELECT id, port, replace(replace(remark,'|','_'),char(10),' '), replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" \
         2>/dev/null)
 
     [ "$idx" -ge 1 ] || { warn "No inbounds found in database."; return 1; }
@@ -387,39 +395,35 @@ auto_build_locations() {
     echo -e "${INFO}Inbounds found:${RESET}"
     local n
     for n in $(seq 1 "$idx"); do
-        echo -e "  ${C_ITEM_6}*${RESET} ${C_ITEM_4}port ${IN_PORT[$n]}${RESET} | ${C_ITEM_5}${IN_NET[$n]}${RESET} | ${C_ITEM_1}${IN_PATH[$n]:-(no path)}${RESET}"
+        echo -e "  ${C_ITEM_6}*${RESET} ${C_ITEM_4}[id=${IN_ID[$n]}]${RESET} ${C_ITEM_9}${IN_REMARK[$n]}${RESET} | port ${C_ITEM_4}${IN_PORT[$n]}${RESET} | ${C_ITEM_5}${IN_NET[$n]}${RESET} | ${C_ITEM_1}${IN_PATH[$n]:-(no path)}${RESET}"
     done
     echo -e "${INFO}Auto-selecting CDN-compatible inbounds (ws / httpupgrade / xhttp / grpc)...${RESET}"
 
     LOCATIONS=""
     local added=0 skipped_transport=0 skipped_path=0 skipped_dup=0
     USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
-    TAKEN_PORTS=""; SEEN_PATHS=""
+    TAKEN_PORTS=""
+    SEEN_PATHS=""
 
-    # We will collect all SQL + host-insert operations then apply them together.
     local -a OP_IDS OP_FPORTS OP_NETS OP_PATHS OP_REMARKS OP_ALPNS
     local op_count=0
 
     local ltype fport inb_id remark alpn_json
     for n in $(seq 1 "$idx"); do
-        port="${IN_PORT[$n]}"; net="${IN_NET[$n]}"
-        path="${IN_PATH[$n]}"; inb_id="${IN_ID[$n]}"
+        port="${IN_PORT[$n]}"
+        net="${IN_NET[$n]}"
+        path="${IN_PATH[$n]}"
+        inb_id="${IN_ID[$n]}"
 
-        # ── Transport filter ────────────────────────────────────────────
         case "$net" in
-            ws)                      ltype="upgrade" ;;
-            httpupgrade)             ltype="upgrade" ;;
-            xhttp|splithttp)         ltype="xhttp"   ;;
-            grpc)
-                # gRPC is proxied differently - we skip nginx location for grpc
-                # but we still create the host entry in the DB for gRPC inbounds.
-                ltype="grpc"
-                ;;
+            ws)              ltype="upgrade" ;;
+            httpupgrade)     ltype="upgrade" ;;
+            xhttp|splithttp) ltype="xhttp"   ;;
+            grpc)            ltype="grpc"    ;;
             *)
                 skipped_transport=$((skipped_transport+1)); continue ;;
         esac
 
-        # ── Path filter (grpc uses serviceName, not path - still valid) ─
         if [ "$ltype" != "grpc" ]; then
             if [ -z "$path" ] || [ "$path" = "/" ]; then
                 skipped_path=$((skipped_path+1)); continue
@@ -430,7 +434,6 @@ auto_build_locations() {
             SEEN_PATHS="${SEEN_PATHS} ${path}"
         fi
 
-        # ── Port conflict check ─────────────────────────────────────────
         fport="$port"
         if [ "$port" = "$HTTPS_PORT" ] || [ "$port" = "$HTTP_PORT" ]; then
             fport=$(free_port) || { err "No free local port available."; return 1; }
@@ -438,13 +441,11 @@ auto_build_locations() {
         fi
         TAKEN_PORTS="${TAKEN_PORTS} ${fport}"
 
-        # ── Determine remark (use network type as remark base) ───────────
-        remark="${net}"
+        # FIX 2: remark از IN_REMARK (دیتابیس) گرفته میشه نه net
+        remark="${IN_REMARK[$n]:-$net}"
 
-        # ── Determine ALPN ──────────────────────────────────────────────
         alpn_json=$(alpn_for_net "$net")
 
-        # ── Store operation ─────────────────────────────────────────────
         op_count=$((op_count+1))
         OP_IDS[$op_count]="$inb_id"
         OP_FPORTS[$op_count]="$fport"
@@ -453,12 +454,12 @@ auto_build_locations() {
         OP_REMARKS[$op_count]="$remark"
         OP_ALPNS[$op_count]="$alpn_json"
 
-        # ── Add nginx location (skip grpc – nginx can't proxy gRPC here without http2) ─
         if [ "$ltype" != "grpc" ]; then
             LOCATIONS="${LOCATIONS}"$'\n'"$(make_location "$ltype" "$path" "$fport")"
         fi
 
-        ok "Queued: ${net} port=${port}->127.0.0.1:${fport} | host: ${PRIMARY}:443 alpn=${alpn_json}"
+        # FIX 3: نمایش CDN_ADDRESS به جای PRIMARY
+        ok "Queued: [${remark}] ${net} port=${port}->127.0.0.1:${fport} | host: ${CDN_ADDRESS}:443 alpn=${alpn_json}"
         added=$((added+1))
     done
 
@@ -470,7 +471,7 @@ auto_build_locations() {
     echo -e "${WARN_BG} ACTION ${RESET} The following changes will be applied to ${added} inbound(s):"
     echo -e "  ${C_ITEM_3}• Set listen = 127.0.0.1${RESET}"
     echo -e "  ${C_ITEM_4}• Remove TLS / externalProxy from stream_settings${RESET}"
-    echo -e "  ${C_ITEM_5}• Create a Host entry for each inbound (port 443, security=tls, sni=${PRIMARY})${RESET}"
+    echo -e "  ${C_ITEM_5}• Create Host entry for each inbound (port 443, security=tls, sni=${CDN_ADDRESS}, override_sni_from_address=1)${RESET}"
     warn "A DB backup will be made first."
     local AP; ask_optional AP "Apply now?" "[y/N]"
 
@@ -482,15 +483,14 @@ auto_build_locations() {
         for m in $(seq 1 "$op_count"); do
             local mid="${OP_IDS[$m]}"
             local mfport="${OP_FPORTS[$m]}"
-            local mnet="${OP_NETS[$m]}"
             local mremark="${OP_REMARKS[$m]}"
             local malpn="${OP_ALPNS[$m]}"
 
-            # 1. Move inbound to 127.0.0.1:fport + strip TLS
+            # 1. Move inbound to 127.0.0.1:fport
             if sqlite3 "$db" \
                 "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};" \
                 2>/tmp/sql_err.log; then
-                ok "  inbound id=${mid}: listen=127.0.0.1 port=${mfport}"
+                ok "  inbound id=${mid} [${mremark}]: listen=127.0.0.1 port=${mfport}"
             else
                 err "  inbound id=${mid}: SQL update failed"; cat /tmp/sql_err.log
                 fail_count=$((fail_count+1)); continue
@@ -505,11 +505,11 @@ auto_build_locations() {
                 warn "  inbound id=${mid}: stream_settings strip warning: $strip_out"
             fi
 
-            # 3. Create host entry in hosts table
+            # 3. FIX 3: آدرس و SNI از CDN_ADDRESS گرفته میشه نه PRIMARY
             local host_out
-            host_out=$(insert_host_py "$db" "$mid" "$mremark" "$PRIMARY" "443" "$PRIMARY" "$malpn" 2>&1)
+            host_out=$(insert_host_py "$db" "$mid" "$mremark" "$CDN_ADDRESS" "443" "$CDN_ADDRESS" "$malpn" 2>&1)
             if echo "$host_out" | grep -q "^OK"; then
-                ok "  inbound id=${mid}: host created -> ${PRIMARY}:443 sni=${PRIMARY} alpn=${malpn}"
+                ok "  inbound id=${mid}: host created -> ${CDN_ADDRESS}:443 sni=${CDN_ADDRESS} alpn=${malpn}"
                 ok_count=$((ok_count+1))
             else
                 err "  inbound id=${mid}: host insert failed: $host_out"
@@ -530,11 +530,14 @@ auto_build_locations() {
     return 0
 }
 
-# ── Gather inputs ─────────────────────────────────────────────────────────
+# ── Gather inputs ──────────────────────────────────────────────────────────
 gather_inputs() {
-    ask DOMAIN "Domain" "(e.g. ex.example.com)"
+    ask DOMAIN "Domain (Nginx server_name)" "(e.g. ex.example.com)"
     DOMAIN=$(printf '%s' "$DOMAIN" | tr ',' ' ' | tr -s ' ' | sed -E 's/^ +| +$//g')
     PRIMARY=$(printf '%s' "$DOMAIN" | awk '{print $1}')
+
+    # FIX 3: CDN_ADDRESS جدا از PRIMARY پرسیده میشه
+    ask CDN_ADDRESS "CDN/Subscription address for host entries" "(e.g. i.goldip.me — address & SNI in 3x-ui hosts)"
 
     ask_port HTTPS_PORT "HTTPS listen port" 443
     ask_port HTTP_PORT  "HTTP listen port"  80
@@ -597,7 +600,7 @@ gather_inputs() {
     fi
 }
 
-# ── Camouflage reverse-proxy block ────────────────────────────────────────
+# ── Camouflage reverse-proxy block ─────────────────────────────────────────
 _build_camo_block() {
     local js_file="/tmp/goldip_js_$$.js"
     cat > "$js_file" <<JSEOF
@@ -654,7 +657,7 @@ JSEOF
     }"
 }
 
-# ── Write nginx config ────────────────────────────────────────────────────
+# ── Write nginx config ─────────────────────────────────────────────────────
 write_config() {
     mkdir -p "$NGINX_CONF_DIR"
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null
@@ -717,7 +720,7 @@ do_install() {
     write_config || return 1; enable_persistence silent
 }
 
-# ── Full Nginx uninstall ──────────────────────────────────────────────────
+# ── Full Nginx uninstall ───────────────────────────────────────────────────
 full_uninstall() {
     echo -e "${ERR_BG} WARNING ${RESET} \033[1;31mThis will COMPLETELY remove Nginx and all GoldIP configs!\033[0m"
     local CONFIRM
@@ -754,7 +757,7 @@ full_uninstall() {
     ok "Nginx fully uninstalled and all configs cleaned."
 }
 
-# ── Domain config remove only ─────────────────────────────────────────────
+# ── Domain config remove only ──────────────────────────────────────────────
 uninstall_domain() {
     local D
     ask D "Domain config to remove" "(e.g. ex.example.com)"
@@ -766,7 +769,7 @@ uninstall_domain() {
     fi
 }
 
-# ── Service control ───────────────────────────────────────────────────────
+# ── Service control ────────────────────────────────────────────────────────
 svc() {
     case "$1" in
         start)   systemctl start nginx   && ok "Nginx started"   || err "Start failed" ;;
@@ -793,7 +796,7 @@ show_status() {
     ss -ltnp 2>/dev/null | grep nginx || warn "No nginx sockets."
 }
 
-# ── Logs ──────────────────────────────────────────────────────────────────
+# ── Logs ───────────────────────────────────────────────────────────────────
 colorize_error_line() {
     local line="$1"
     printf '%s' "$line" | grep -qiE '\[(error|crit|alert|emerg)\]' \
@@ -847,7 +850,7 @@ view_logs() {
         || tail -n 50 "$target" | while IFS= read -r line; do colorize_access_line "$line"; done
 }
 
-# ── CDN IP ranges ─────────────────────────────────────────────────────────
+# ── CDN IP ranges ──────────────────────────────────────────────────────────
 fetch_cloudflare_ranges() {
     local v4="" v6=""
     if command -v curl >/dev/null 2>&1; then
@@ -907,7 +910,7 @@ write_realip() {
 }
 write_cf_realip() { write_realip cloudflare; }
 
-# ── Trusted domain & service-port auto-detection ──────────────────────────
+# ── Trusted domain & service-port auto-detection ───────────────────────────
 resolve_domain_ips_v4() {
     local domain="$1" ips=""
     if command -v getent >/dev/null 2>&1; then
@@ -960,9 +963,9 @@ open_xui_panel_and_sub_ports() {
     ensure_sqlite3 || return 1
 
     local webport subport subenable
-    webport=$(sqlite3 "$db"   "SELECT value FROM settings WHERE key='webPort';"    2>/dev/null | tr -d '[:space:]')
-    subport=$(sqlite3 "$db"   "SELECT value FROM settings WHERE key='subPort';"    2>/dev/null | tr -d '[:space:]')
-    subenable=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='subEnable';"  2>/dev/null | tr -d '[:space:]')
+    webport=$(sqlite3 "$db"   "SELECT value FROM settings WHERE key='webPort';"   2>/dev/null | tr -d '[:space:]')
+    subport=$(sqlite3 "$db"   "SELECT value FROM settings WHERE key='subPort';"   2>/dev/null | tr -d '[:space:]')
+    subenable=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='subEnable';" 2>/dev/null | tr -d '[:space:]')
 
     if is_number "$webport"; then
         ufw allow "${webport}/tcp" >/dev/null 2>&1 && ok "Panel port ${webport}/tcp opened (auto-detected from x-ui.db)."
@@ -984,7 +987,7 @@ open_xui_panel_and_sub_ports() {
     esac
 }
 
-# ── Firewall setup ────────────────────────────────────────────────────────
+# ── Firewall setup ─────────────────────────────────────────────────────────
 setup_firewall() {
     command -v ufw >/dev/null 2>&1 || {
         warn "ufw not found. Installing..."
@@ -1067,7 +1070,7 @@ firewall_status() {
     command -v ufw >/dev/null 2>&1 && ufw status verbose || warn "ufw not installed."
 }
 
-# ── Watchdog ──────────────────────────────────────────────────────────────
+# ── Watchdog ───────────────────────────────────────────────────────────────
 install_watchdog() {
     cat > /usr/local/bin/goldip-watchdog.sh <<'WEOF'
 #!/bin/bash
@@ -1102,7 +1105,7 @@ TEOF
     warn "To stop: systemctl disable --now goldip-watchdog.timer"
 }
 
-# ── Persistence ───────────────────────────────────────────────────────────
+# ── Persistence ────────────────────────────────────────────────────────────
 enable_persistence() {
     local mode="${1:-}"
     if command -v nginx >/dev/null 2>&1; then
@@ -1149,13 +1152,12 @@ XEOF
     fi
 }
 
-# ── Menu ──────────────────────────────────────────────────────────────────
+# ── Menu ───────────────────────────────────────────────────────────────────
 menu() {
     while true; do
         clear
         echo -e "${TITLE}"; header; echo -e "${RESET}"
 
-        # Each menu line has its own unique colour. Green/Red only for ok()/err().
         echo -e "  ${C_ITEM_1}1)${RESET}  ${C_ITEM_1}Install / Config website${RESET}"
         echo -e "  ${C_ITEM_2}2)${RESET}  ${C_ITEM_2}Start Nginx${RESET}"
         echo -e "  ${C_ITEM_3}3)${RESET}  ${C_ITEM_3}Stop Nginx${RESET}"
@@ -1191,6 +1193,6 @@ menu() {
     done
 }
 
-# ── Entry ─────────────────────────────────────────────────────────────────
+# ── Entry ──────────────────────────────────────────────────────────────────
 require_root
 menu
