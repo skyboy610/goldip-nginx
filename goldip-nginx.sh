@@ -1,23 +1,46 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v2.1
+#  GoldIP Nginx Camouflage Installer & Manager  v3.0
+#  Compatible with 3x-ui >= 3.4.1 (hosts table, no externalProxy)
 # ============================================================
 set -uo pipefail
 
 RESET='\033[0m'
-M1='\033[1;36m'; M2='\033[1;35m'; M3='\033[1;34m'; M4='\033[1;32m'
-M5='\033[1;33m'; M6='\033[1;31m'; M7='\033[1;95m'; M8='\033[1;96m'
-M9='\033[1;92m'; M10='\033[1;93m'; M11='\033[1;94m'; M12='\033[1;91m'
-TITLE='\033[1;36m'; PROMPT='\033[1;96m'; HINT='\033[1;97m'; INFO='\033[1;34m'
-OK_BG='\033[42m\033[97m'; WARN_BG='\033[43m\033[97m'; ERR_BG='\033[41m\033[97m'
 
-ok()   { echo -e "${OK_BG} OK ${RESET} $1"; }
-warn() { echo -e "${WARN_BG} WARN ${RESET} $1"; }
-err()  { echo -e "${ERR_BG} ERROR ${RESET} $1"; }
+# ── Message badge colours (green/red reserved for ok/err) ─────────────────
+OK_BG='\033[42m\033[97m'
+WARN_BG='\033[43m\033[97m'
+ERR_BG='\033[41m\033[97m'
+
+ok()   { echo -e "${OK_BG} OK ${RESET} \033[1;32m$1\033[0m"; }
+warn() { echo -e "${WARN_BG} WARN ${RESET} \033[1;33m$1\033[0m"; }
+err()  { echo -e "${ERR_BG} ERROR ${RESET} \033[1;31m$1\033[0m"; }
+
+# ── Prompt/label colours ──────────────────────────────────────────────────
+PROMPT='\033[1;96m'
+HINT='\033[1;97m'
+INFO='\033[1;34m'
+TITLE='\033[1;36m'
+
+# ── Menu item colours  (NO green/red) ────────────────────────────────────
+# Each colour is used on exactly ONE line in the menu
+C_ITEM_1='\033[1;36m'    # Cyan          – line 1
+C_ITEM_2='\033[1;35m'    # Magenta        – line 2
+C_ITEM_3='\033[1;34m'    # Blue           – line 3
+C_ITEM_4='\033[1;33m'    # Yellow         – line 4
+C_ITEM_5='\033[1;95m'    # Bright Magenta – line 5
+C_ITEM_6='\033[1;96m'    # Bright Cyan    – line 6
+C_ITEM_7='\033[1;94m'    # Bright Blue    – line 7
+C_ITEM_8='\033[1;91m'    # RED            – line 8 (Remove domain - allowed)
+C_ITEM_9='\033[1;93m'    # Bright Yellow  – line 9
+C_ITEM_10='\033[1;97m'   # White          – line 10
+C_ITEM_11='\033[38;5;214m'  # Orange      – line 11
+C_ITEM_12='\033[1;91m'   # RED            – line 12 (Full uninstall - allowed)
+C_ITEM_0='\033[38;5;245m'   # Grey        – line 0 (Exit)
 
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 CAMO_ROOT="/var/www/goldip"
-GOLDIP_DOMAIN="goldip.net"   # Trusted control domain - always whitelisted in firewall (all ports)
+GOLDIP_DOMAIN="goldip.net"
 
 CF_V4_DEFAULT="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22"
 CF_V6_DEFAULT="2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
@@ -25,7 +48,7 @@ ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.11
 ARVAN_V6_DEFAULT=""
 CF_V4=""; CF_V6=""; ARVAN_V4=""; ARVAN_V6=""
 
-# ---------------- Input helpers ----------------
+# ── Input helpers ──────────────────────────────────────────────────────────
 ask() {
     local __var="$1" __q="$2" __hint="${3:-}" __ans
     while true; do
@@ -88,13 +111,9 @@ ask_choice() {
         warn "Invalid choice. Allowed: ${__valid//|/, }"
     done
 }
-is_yes() { case "$1" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
+is_yes()    { case "$1" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
 is_number() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
-# Accepts a domain/URL with or without a scheme. If no scheme is given, https:// is assumed.
-# e.g. "example.com"            -> "https://example.com"
-#      "example.com/sub/path"   -> "https://example.com/sub/path"
-#      "http://example.com"     -> unchanged
 normalize_url() {
     local u="$1"
     case "$u" in
@@ -103,7 +122,7 @@ normalize_url() {
     esac
 }
 
-# ---------------- Header ----------------
+# ── Header ────────────────────────────────────────────────────────────────
 header() {
 cat <<'EOF'
 ==========================================================
@@ -112,7 +131,8 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v2.1
+    N G I N X   C A M O U F L A G E   v3.0
+    Compatible with 3x-ui >= 3.4.1 (Hosts API)
 ==========================================================
 EOF
 }
@@ -121,7 +141,7 @@ require_root() {
     [ "$(id -u)" -eq 0 ] || { err "Run this script as root."; exit 1; }
 }
 
-# ---------------- Locate x-ui database ----------------
+# ── Locate x-ui database ──────────────────────────────────────────────────
 find_xui_db() {
     local c
     for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do
@@ -130,7 +150,7 @@ find_xui_db() {
     return 1
 }
 
-# ---------------- Ensure sqlite3 ----------------
+# ── Ensure sqlite3 ───────────────────────────────────────────────────────
 ensure_sqlite3() {
     command -v sqlite3 >/dev/null 2>&1 && return 0
     warn "sqlite3 not found. Installing..."
@@ -145,7 +165,7 @@ ensure_sqlite3() {
     warn "Could not install sqlite3."; return 1
 }
 
-# ---------------- Install Nginx ----------------
+# ── Install Nginx ─────────────────────────────────────────────────────────
 install_nginx() {
     if command -v nginx >/dev/null 2>&1; then
         ok "Nginx already installed ($(nginx -v 2>&1 | sed 's#.*/##'))."; return 0
@@ -163,7 +183,7 @@ install_nginx() {
     fi
 }
 
-# ---------------- Browser-realistic location block ----------------
+# ── Browser-realistic location block ─────────────────────────────────────
 make_location() {
     local t="$1" p="$2" port="$3"
     if [ "$t" = "xhttp" ]; then
@@ -213,7 +233,7 @@ make_location() {
     fi
 }
 
-# ---------------- Find a free local port ----------------
+# ── Find a free local port ────────────────────────────────────────────────
 free_port() {
     local p
     for p in $(seq 20000 29999); do
@@ -223,44 +243,111 @@ free_port() {
     done; return 1
 }
 
-# ---------------- Transform inbound JSON ----------------
-# External Proxy new 3x-ui format: forceTls + sni + fingerprint + alpn (string, comma-separated)
-transform_inbound_json() {
-    python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
-import json, sys
+# ── Determine ALPN for a given network type ───────────────────────────────
+#    ws / httpupgrade  -> ["http/1.1"]
+#    xhttp / splithttp -> ["http/1.1","h2"]
+#    grpc              -> ["h2"]
+#    fallback          -> ["http/1.1"]
+alpn_for_net() {
+    local net="$1"
+    case "$net" in
+        grpc)              printf '["h2"]' ;;
+        xhttp|splithttp)   printf '["http/1.1","h2"]' ;;
+        *)                 printf '["http/1.1"]' ;;
+    esac
+}
 
-raw, domain, hport, setep = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+# ── Insert a host row via Python (uses sqlite3 module, no CLI needed) ─────
+#
+#   Usage: insert_host_py DB INB_ID REMARK ADDRESS PORT SNI ALPN_JSON
+#
+#   All seven arguments are positional.
+#   Returns 0 on success, non-zero on failure.
+insert_host_py() {
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYEOF'
+import sqlite3, sys, time
+
+db_path   = sys.argv[1]
+inbound_id= int(sys.argv[2])
+remark    = sys.argv[3]
+address   = sys.argv[4]
+port      = int(sys.argv[5])
+sni       = sys.argv[6]
+alpn_json = sys.argv[7]  # e.g. '["http/1.1"]'
+now_ms    = int(time.time() * 1000)
+
 try:
-    ss = json.loads(raw)
-except Exception:
-    sys.exit(2)
-if not isinstance(ss, dict):
-    sys.exit(2)
-
-ss["security"] = "none"
-for k in ("tlsSettings", "realitySettings", "externalProxySettings", "externalProxy"):
-    ss.pop(k, None)
-
-if setep == "1":
-    try:
-        port = int(hport)
-    except ValueError:
-        port = 443
-    ss["externalProxy"] = [{
-        "forceTls":    "tls",
-        "dest":        domain,
-        "port":        port,
-        "remark":      "",
-        "sni":         domain,
-        "fingerprint": "chrome",
-        "alpn":        "h2,http/1.1"
-    }]
-
-json.dump(ss, sys.stdout, separators=(",", ":"), ensure_ascii=False)
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO hosts (
+            inbound_id, sort_order, remark, server_description,
+            is_disabled, is_hidden, tags, address, port,
+            security, sni, host_header, path, alpn,
+            fingerprint, override_sni_from_address, keep_sni_blank,
+            pinned_peer_cert_sha256, verify_peer_cert_by_name,
+            allow_insecure, ech_config_list, mux_params, sockopt_params,
+            final_mask, vless_route, exclude_from_sub_types,
+            mihomo_ip_version, mihomo_x25519, shuffle_host, node_guids,
+            created_at, updated_at
+        ) VALUES (
+            ?, 0, ?, '',
+            0, 0, NULL, ?, ?,
+            'tls', ?, '', '', ?,
+            'chrome', 1, 0,
+            NULL, '',
+            0, '', '', '',
+            '', '', NULL,
+            '', 0, 0, NULL,
+            ?, ?
+        )
+    """, (
+        inbound_id, remark, address, port,
+        sni, alpn_json,
+        now_ms, now_ms
+    ))
+    con.commit()
+    con.close()
+    print(f"OK host inserted for inbound_id={inbound_id} remark={remark} address={address}:{port}")
+    sys.exit(0)
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
 PYEOF
 }
 
-# ---------------- Auto build locations from x-ui DB ----------------
+# ── Strip TLS from stream_settings in the DB (security -> none) ──────────
+strip_tls_py() {
+    python3 - "$1" "$2" <<'PYEOF'
+import sqlite3, json, sys
+
+db_path   = sys.argv[1]
+inbound_id= int(sys.argv[2])
+
+try:
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.execute("SELECT stream_settings FROM inbounds WHERE id=?", (inbound_id,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        con.close(); sys.exit(0)
+    ss = json.loads(row[0])
+    ss["security"] = "none"
+    for k in ("tlsSettings", "realitySettings", "externalProxy", "externalProxySettings"):
+        ss.pop(k, None)
+    new_json = json.dumps(ss, separators=(",", ":"), ensure_ascii=False)
+    cur.execute("UPDATE inbounds SET stream_settings=? WHERE id=?", (new_json, inbound_id))
+    con.commit()
+    con.close()
+    print(f"OK stream_settings updated for inbound_id={inbound_id}")
+    sys.exit(0)
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+# ── Auto-build locations AND create hosts in DB ────────────────────────────
 auto_build_locations() {
     local db=""
     db=$(find_xui_db)
@@ -271,62 +358,79 @@ auto_build_locations() {
     ensure_sqlite3 || return 1
     ok "Reading inbounds from: $db"
 
+    # ── Check python3 ────────────────────────────────────────────────────
+    local HAVE_PY=0
+    command -v python3 >/dev/null 2>&1 && HAVE_PY=1
+    [ "$HAVE_PY" = "1" ] || { err "python3 is required for host creation. Please install it."; return 1; }
+
+    # ── Read all inbounds ─────────────────────────────────────────────────
     local -a IN_ID IN_PORT IN_NET IN_PATH IN_SS
     local idx=0 id port ss net rawpath path
     while IFS='|' read -r id port ss; do
         [ -n "$port" ] || continue
         case "$id"   in ''|*[!0-9]*) continue ;; esac
         case "$port" in    *[!0-9]*) continue ;; esac
-        net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
-        rawpath=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
+        net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 \
+              | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
+        rawpath=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 \
+                  | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         path="${rawpath%%\?*}"
         idx=$((idx+1))
         IN_ID[$idx]="$id"; IN_PORT[$idx]="$port"
         IN_NET[$idx]="${net:-unknown}"; IN_PATH[$idx]="$path"; IN_SS[$idx]="$ss"
     done < <(sqlite3 -separator '|' "$db" \
-        "SELECT id, port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
+        "SELECT id, port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" \
+        2>/dev/null)
 
     [ "$idx" -ge 1 ] || { warn "No inbounds found in database."; return 1; }
 
     echo -e "${INFO}Inbounds found:${RESET}"
     local n
     for n in $(seq 1 "$idx"); do
-        echo -e "  ${M8}*${RESET} ${M4}port ${IN_PORT[$n]}${RESET} | ${M5}${IN_NET[$n]}${RESET} | ${M1}${IN_PATH[$n]:-(no path)}${RESET}"
+        echo -e "  ${C_ITEM_6}*${RESET} ${C_ITEM_4}port ${IN_PORT[$n]}${RESET} | ${C_ITEM_5}${IN_NET[$n]}${RESET} | ${C_ITEM_1}${IN_PATH[$n]:-(no path)}${RESET}"
     done
-    echo -e "${INFO}Auto-selecting CDN-compatible inbounds (ws/httpupgrade/xhttp)...${RESET}"
+    echo -e "${INFO}Auto-selecting CDN-compatible inbounds (ws / httpupgrade / xhttp / grpc)...${RESET}"
 
     LOCATIONS=""
     local added=0 skipped_transport=0 skipped_path=0 skipped_dup=0
-    local SQL_UPDATES=""
-    local TLSOFF="stream_settings=replace(replace(stream_settings,'\"security\": \"tls\"','\"security\":\"none\"'),'\"security\":\"tls\"','\"security\":\"none\"')"
     USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""; SEEN_PATHS=""
 
-    local HAVE_PY=0
-    command -v python3 >/dev/null 2>&1 && HAVE_PY=1
-    local EP_AUTO=1
-    [ "$HAVE_PY" = "1" ] || { warn "python3 not found: External Proxy skipped."; EP_AUTO=0; }
+    # We will collect all SQL + host-insert operations then apply them together.
+    local -a OP_IDS OP_FPORTS OP_NETS OP_PATHS OP_REMARKS OP_ALPNS
+    local op_count=0
 
-    local ltype fport inb_id newjson
+    local ltype fport inb_id remark alpn_json
     for n in $(seq 1 "$idx"); do
         port="${IN_PORT[$n]}"; net="${IN_NET[$n]}"
         path="${IN_PATH[$n]}"; inb_id="${IN_ID[$n]}"
 
+        # ── Transport filter ────────────────────────────────────────────
         case "$net" in
-            ws|httpupgrade)  ltype="upgrade" ;;
-            xhttp|splithttp) ltype="xhttp"   ;;
-            *) skipped_transport=$((skipped_transport+1)); continue ;;
+            ws)                      ltype="upgrade" ;;
+            httpupgrade)             ltype="upgrade" ;;
+            xhttp|splithttp)         ltype="xhttp"   ;;
+            grpc)
+                # gRPC is proxied differently - we skip nginx location for grpc
+                # but we still create the host entry in the DB for gRPC inbounds.
+                ltype="grpc"
+                ;;
+            *)
+                skipped_transport=$((skipped_transport+1)); continue ;;
         esac
 
-        if [ -z "$path" ] || [ "$path" = "/" ]; then
-            skipped_path=$((skipped_path+1)); continue
+        # ── Path filter (grpc uses serviceName, not path - still valid) ─
+        if [ "$ltype" != "grpc" ]; then
+            if [ -z "$path" ] || [ "$path" = "/" ]; then
+                skipped_path=$((skipped_path+1)); continue
+            fi
+            case " $SEEN_PATHS " in
+                *" $path "*) skipped_dup=$((skipped_dup+1)); continue ;;
+            esac
+            SEEN_PATHS="${SEEN_PATHS} ${path}"
         fi
 
-        case " $SEEN_PATHS " in
-            *" $path "*) skipped_dup=$((skipped_dup+1)); continue ;;
-        esac
-        SEEN_PATHS="${SEEN_PATHS} ${path}"
-
+        # ── Port conflict check ─────────────────────────────────────────
         fport="$port"
         if [ "$port" = "$HTTPS_PORT" ] || [ "$port" = "$HTTP_PORT" ]; then
             fport=$(free_port) || { err "No free local port available."; return 1; }
@@ -334,52 +438,99 @@ auto_build_locations() {
         fi
         TAKEN_PORTS="${TAKEN_PORTS} ${fport}"
 
-        if [ "$HAVE_PY" = "1" ]; then
-            if newjson=$(transform_inbound_json "${IN_SS[$n]}" "$PRIMARY" "$HTTPS_PORT" "$EP_AUTO" 2>/dev/null); then
-                newjson="${newjson//\'/\'\'}"
-                SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, stream_settings='${newjson}' WHERE id=${inb_id};"$'\n'
-                ok "Added: ${net} ${path} -> 127.0.0.1:${fport} + ExternalProxy [sni+fp+alpn]"
-            else
-                warn "JSON parse failed for port ${port}, TLS-off fallback."
-                SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, ${TLSOFF} WHERE id=${inb_id};"$'\n'
-                ok "Added: ${net} ${path} -> 127.0.0.1:${fport} (TLS off)"
-            fi
-        else
-            SQL_UPDATES="${SQL_UPDATES}UPDATE inbounds SET listen='127.0.0.1', port=${fport}, ${TLSOFF} WHERE id=${inb_id};"$'\n'
-            ok "Added: ${net} ${path} -> 127.0.0.1:${fport}"
+        # ── Determine remark (use network type as remark base) ───────────
+        remark="${net}"
+
+        # ── Determine ALPN ──────────────────────────────────────────────
+        alpn_json=$(alpn_for_net "$net")
+
+        # ── Store operation ─────────────────────────────────────────────
+        op_count=$((op_count+1))
+        OP_IDS[$op_count]="$inb_id"
+        OP_FPORTS[$op_count]="$fport"
+        OP_NETS[$op_count]="$net"
+        OP_PATHS[$op_count]="$path"
+        OP_REMARKS[$op_count]="$remark"
+        OP_ALPNS[$op_count]="$alpn_json"
+
+        # ── Add nginx location (skip grpc – nginx can't proxy gRPC here without http2) ─
+        if [ "$ltype" != "grpc" ]; then
+            LOCATIONS="${LOCATIONS}"$'\n'"$(make_location "$ltype" "$path" "$fport")"
         fi
 
-        LOCATIONS="${LOCATIONS}"$'\n'"$(make_location "$ltype" "$path" "$fport")"
+        ok "Queued: ${net} port=${port}->127.0.0.1:${fport} | host: ${PRIMARY}:443 alpn=${alpn_json}"
         added=$((added+1))
     done
 
     echo ""
-    echo -e "${INFO}Summary: ${M4}${added} added${RESET} | skipped: ${skipped_transport} transport, ${skipped_path} no-path, ${skipped_dup} duplicate${RESET}"
+    echo -e "${INFO}Summary: ${C_ITEM_4}${added} queued${RESET} | skipped: ${skipped_transport} transport, ${skipped_path} no-path, ${skipped_dup} duplicate${RESET}"
     [ "$added" -ge 1 ] || { warn "No eligible inbounds found."; return 1; }
 
-    if [ -n "$SQL_UPDATES" ]; then
-        echo ""
-        echo -e "${WARN_BG} ACTION ${RESET} Apply listen=127.0.0.1 + ExternalProxy to ${added} inbound(s)?"
-        warn "Backup made first. Tunnel inbounds untouched."
-        local AP; ask_optional AP "Apply now?" "[y/N]"
-        if is_yes "$AP"; then
-            local bak="${db}.bak.$(date +%s)"
-            cp "$db" "$bak" && ok "DB backed up: $bak" || { err "Backup failed."; return 0; }
-            if printf '%s\n' "$SQL_UPDATES" | sqlite3 "$db" 2>/tmp/sql_err.log; then
-                ok "Database updated."
-                systemctl restart x-ui 2>/dev/null && ok "x-ui restarted." \
-                    || warn "Could not restart x-ui. Run: x-ui restart"
+    echo ""
+    echo -e "${WARN_BG} ACTION ${RESET} The following changes will be applied to ${added} inbound(s):"
+    echo -e "  ${C_ITEM_3}• Set listen = 127.0.0.1${RESET}"
+    echo -e "  ${C_ITEM_4}• Remove TLS / externalProxy from stream_settings${RESET}"
+    echo -e "  ${C_ITEM_5}• Create a Host entry for each inbound (port 443, security=tls, sni=${PRIMARY})${RESET}"
+    warn "A DB backup will be made first."
+    local AP; ask_optional AP "Apply now?" "[y/N]"
+
+    if is_yes "$AP"; then
+        local bak="${db}.bak.$(date +%s)"
+        cp "$db" "$bak" && ok "DB backed up: $bak" || { err "Backup failed."; return 1; }
+
+        local m ok_count=0 fail_count=0
+        for m in $(seq 1 "$op_count"); do
+            local mid="${OP_IDS[$m]}"
+            local mfport="${OP_FPORTS[$m]}"
+            local mnet="${OP_NETS[$m]}"
+            local mremark="${OP_REMARKS[$m]}"
+            local malpn="${OP_ALPNS[$m]}"
+
+            # 1. Move inbound to 127.0.0.1:fport + strip TLS
+            if sqlite3 "$db" \
+                "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};" \
+                2>/tmp/sql_err.log; then
+                ok "  inbound id=${mid}: listen=127.0.0.1 port=${mfport}"
             else
-                err "DB update failed; restoring backup."; cp "$bak" "$db"; cat /tmp/sql_err.log
+                err "  inbound id=${mid}: SQL update failed"; cat /tmp/sql_err.log
+                fail_count=$((fail_count+1)); continue
             fi
-        else
-            warn "Skipped DB change. Set listen=127.0.0.1 manually in panel."
+
+            # 2. Strip TLS / externalProxy from stream_settings
+            local strip_out
+            strip_out=$(strip_tls_py "$db" "$mid" 2>&1)
+            if echo "$strip_out" | grep -q "^OK"; then
+                ok "  inbound id=${mid}: stream_settings cleaned"
+            else
+                warn "  inbound id=${mid}: stream_settings strip warning: $strip_out"
+            fi
+
+            # 3. Create host entry in hosts table
+            local host_out
+            host_out=$(insert_host_py "$db" "$mid" "$mremark" "$PRIMARY" "443" "$PRIMARY" "$malpn" 2>&1)
+            if echo "$host_out" | grep -q "^OK"; then
+                ok "  inbound id=${mid}: host created -> ${PRIMARY}:443 sni=${PRIMARY} alpn=${malpn}"
+                ok_count=$((ok_count+1))
+            else
+                err "  inbound id=${mid}: host insert failed: $host_out"
+                fail_count=$((fail_count+1))
+            fi
+        done
+
+        echo ""
+        ok "Done: ${ok_count} hosts created, ${fail_count} failures."
+        if [ "$fail_count" -gt 0 ]; then
+            warn "Some operations failed. Check errors above. Backup is at: $bak"
         fi
+        systemctl restart x-ui 2>/dev/null && ok "x-ui restarted." \
+            || warn "Could not restart x-ui. Run: x-ui restart"
+    else
+        warn "Skipped DB changes. Set listen=127.0.0.1 and add hosts manually in panel."
     fi
     return 0
 }
 
-# ---------------- Gather inputs ----------------
+# ── Gather inputs ─────────────────────────────────────────────────────────
 gather_inputs() {
     ask DOMAIN "Domain" "(e.g. ex.example.com)"
     DOMAIN=$(printf '%s' "$DOMAIN" | tr ',' ' ' | tr -s ' ' | sed -E 's/^ +| +$//g')
@@ -395,8 +546,8 @@ gather_inputs() {
 
     LOCATIONS=""
     echo -e "${INFO}Inbound configuration:${RESET}"
-    echo -e "  ${M1}1)${RESET} ${M4}Auto (read from x-ui database)${RESET}"
-    echo -e "  ${M2}2)${RESET} ${M5}Manual entry${RESET}"
+    echo -e "  ${C_ITEM_1}1)${RESET} ${C_ITEM_4}Auto (read from x-ui database + create hosts)${RESET}"
+    echo -e "  ${C_ITEM_2}2)${RESET} ${C_ITEM_5}Manual entry${RESET}"
     ask_choice DISC "Selection" "1|2"
 
     if [ "$DISC" = "1" ] && auto_build_locations; then
@@ -411,7 +562,7 @@ gather_inputs() {
             [ "${P_PATH:0:1}" = "/" ] || P_PATH="/$P_PATH"
             ask_number P_PORT "Local Xray port"
             echo -e "${INFO}Transport:${RESET}"
-            echo -e "  ${M1}1)${RESET} WebSocket  ${M2}2)${RESET} HTTPUpgrade  ${M3}3)${RESET} XHTTP"
+            echo -e "  ${C_ITEM_1}1)${RESET} WebSocket  ${C_ITEM_2}2)${RESET} HTTPUpgrade  ${C_ITEM_3}3)${RESET} XHTTP"
             ask_choice P_TYPE "Selection" "1|2|3"
             case "$P_TYPE" in
                 1|2) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location upgrade "$P_PATH" "$P_PORT")" ;;
@@ -422,8 +573,8 @@ gather_inputs() {
     fi
 
     echo -e "${INFO}Camouflage site:${RESET}"
-    echo -e "  ${M1}1)${RESET} ${M4}Reverse-proxy to existing website${RESET}"
-    echo -e "  ${M2}2)${RESET} ${M5}Serve local HTML file${RESET}"
+    echo -e "  ${C_ITEM_1}1)${RESET} ${C_ITEM_4}Reverse-proxy to existing website${RESET}"
+    echo -e "  ${C_ITEM_2}2)${RESET} ${C_ITEM_5}Serve local HTML file${RESET}"
     ask_choice CAMO "Selection" "1|2"
 
     if [ "$CAMO" = "1" ]; then
@@ -446,7 +597,7 @@ gather_inputs() {
     fi
 }
 
-# Build the camouflage reverse-proxy block with JS interceptor
+# ── Camouflage reverse-proxy block ────────────────────────────────────────
 _build_camo_block() {
     local js_file="/tmp/goldip_js_$$.js"
     cat > "$js_file" <<JSEOF
@@ -503,7 +654,7 @@ JSEOF
     }"
 }
 
-# ---------------- Write config ----------------
+# ── Write nginx config ────────────────────────────────────────────────────
 write_config() {
     mkdir -p "$NGINX_CONF_DIR"
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null
@@ -566,9 +717,9 @@ do_install() {
     write_config || return 1; enable_persistence silent
 }
 
-# ---------------- Full Nginx Uninstall ----------------
+# ── Full Nginx uninstall ──────────────────────────────────────────────────
 full_uninstall() {
-    echo -e "${ERR_BG} WARNING ${RESET} This will COMPLETELY remove Nginx and all GoldIP configs!"
+    echo -e "${ERR_BG} WARNING ${RESET} \033[1;31mThis will COMPLETELY remove Nginx and all GoldIP configs!\033[0m"
     local CONFIRM
     ask_optional CONFIRM "Type YES to confirm full uninstall" "(anything else cancels)"
     [ "$CONFIRM" = "YES" ] || { warn "Cancelled."; return; }
@@ -603,7 +754,7 @@ full_uninstall() {
     ok "Nginx fully uninstalled and all configs cleaned."
 }
 
-# ---------------- Domain config remove only ----------------
+# ── Domain config remove only ─────────────────────────────────────────────
 uninstall_domain() {
     local D
     ask D "Domain config to remove" "(e.g. ex.example.com)"
@@ -615,7 +766,7 @@ uninstall_domain() {
     fi
 }
 
-# ---------------- Service control ----------------
+# ── Service control ───────────────────────────────────────────────────────
 svc() {
     case "$1" in
         start)   systemctl start nginx   && ok "Nginx started"   || err "Start failed" ;;
@@ -642,7 +793,7 @@ show_status() {
     ss -ltnp 2>/dev/null | grep nginx || warn "No nginx sockets."
 }
 
-# ---------------- Logs ----------------
+# ── Logs ──────────────────────────────────────────────────────────────────
 colorize_error_line() {
     local line="$1"
     printf '%s' "$line" | grep -qiE '\[(error|crit|alert|emerg)\]' \
@@ -651,7 +802,7 @@ colorize_error_line() {
         && { echo -e "${WARN_BG} WARN ${RESET} $line"; return; }
     printf '%s' "$line" | grep -qiE '\[notice\]' \
         && { echo -e "${OK_BG} NOTE ${RESET} $line"; return; }
-    echo -e "${M3}$line${RESET}"
+    echo -e "${C_ITEM_3}$line${RESET}"
 }
 colorize_access_line() {
     local line="$1" code
@@ -661,7 +812,7 @@ colorize_access_line() {
         5*) echo -e "${ERR_BG} ${code} ${RESET} $line" ;;
         4*) echo -e "${WARN_BG} ${code} ${RESET} $line" ;;
         2*|3*) echo -e "${OK_BG} ${code} ${RESET} $line" ;;
-        *) echo -e "${M8}$line${RESET}" ;;
+        *) echo -e "${C_ITEM_6}$line${RESET}" ;;
     esac
 }
 view_logs() {
@@ -674,7 +825,7 @@ view_logs() {
     local n size
     for n in $(seq 1 "$i"); do
         size=$(du -h "${LOGS[$n]}" 2>/dev/null | awk '{print $1}')
-        echo -e "  ${M8}${n})${RESET} ${M4}${LOGS[$n]}${RESET} ${M5}(${size:-0})${RESET}"
+        echo -e "  ${C_ITEM_6}${n})${RESET} ${C_ITEM_4}${LOGS[$n]}${RESET} ${C_ITEM_5}(${size:-0})${RESET}"
     done
     local PICK follow=0
     ask PICK "Log number" "(or 'f' for live-follow)"
@@ -696,7 +847,7 @@ view_logs() {
         || tail -n 50 "$target" | while IFS= read -r line; do colorize_access_line "$line"; done
 }
 
-# ---------------- CDN IP ranges ----------------
+# ── CDN IP ranges ─────────────────────────────────────────────────────────
 fetch_cloudflare_ranges() {
     local v4="" v6=""
     if command -v curl >/dev/null 2>&1; then
@@ -756,7 +907,7 @@ write_realip() {
 }
 write_cf_realip() { write_realip cloudflare; }
 
-# ---------------- Trusted domain & service-port auto-detection ----------------
+# ── Trusted domain & service-port auto-detection ──────────────────────────
 resolve_domain_ips_v4() {
     local domain="$1" ips=""
     if command -v getent >/dev/null 2>&1; then
@@ -784,7 +935,6 @@ resolve_domain_ips_v6() {
     printf '%s\n' "$ips"
 }
 
-# Always-trust rule for the management domain - ALL ports/protocols, not just 80/443.
 whitelist_goldip() {
     local v4 v6 ip hit=0
     v4=$(resolve_domain_ips_v4 "$GOLDIP_DOMAIN")
@@ -798,11 +948,9 @@ whitelist_goldip() {
             && { ok "Whitelisted ${GOLDIP_DOMAIN} (${ip}) - all ports/protocols allowed."; hit=1; }
     done
     [ "$hit" -eq 1 ] || warn "Failed to add ufw rule(s) for ${GOLDIP_DOMAIN}."
-    warn "Note: if ${GOLDIP_DOMAIN} is CDN-proxied (orange-cloud), this resolves to a shared CDN IP, not your origin server - use a DNS-only (grey-cloud) record for this domain if you need a real per-server trust rule."
+    warn "Note: if ${GOLDIP_DOMAIN} is CDN-proxied (orange-cloud), this resolves to a shared CDN IP."
 }
 
-# Reads x-ui panel/subscription ports straight from the database and opens them.
-# Assumes the standard 3x-ui settings keys: webPort, subEnable, subPort.
 open_xui_panel_and_sub_ports() {
     local db; db=$(find_xui_db)
     if [ -z "$db" ]; then
@@ -831,12 +979,12 @@ open_xui_panel_and_sub_ports() {
             fi
             ;;
         *)
-            warn "Subscription service looks disabled (or unset) - leaving its port closed. Re-run firewall setup after enabling it."
+            warn "Subscription service looks disabled (or unset) - leaving its port closed."
             ;;
     esac
 }
 
-# ---------------- Firewall ----------------
+# ── Firewall setup ────────────────────────────────────────────────────────
 setup_firewall() {
     command -v ufw >/dev/null 2>&1 || {
         warn "ufw not found. Installing..."
@@ -848,7 +996,7 @@ setup_firewall() {
         command -v ufw >/dev/null 2>&1 || { err "ufw install failed."; return 1; }
     }
     echo -e "${INFO}CDN Provider:${RESET}"
-    echo -e "  ${M1}1)${RESET} Cloudflare  ${M2}2)${RESET} ArvanCloud  ${M3}3)${RESET} Both  ${M8}4)${RESET} Custom"
+    echo -e "  ${C_ITEM_1}1)${RESET} Cloudflare  ${C_ITEM_2}2)${RESET} ArvanCloud  ${C_ITEM_3}3)${RESET} Both  ${C_ITEM_6}4)${RESET} Custom"
     local CDN_CHOICE; ask_choice CDN_CHOICE "Selection" "1|2|3|4"
     local RANGES="" RANGES6=""
     case "$CDN_CHOICE" in
@@ -866,8 +1014,6 @@ setup_firewall() {
     ask_port FW_HTTP  "HTTP port" 80
     ask_port_optional TUN_PORT "Tunnel port (e.g. 8443)"
     [ -n "$TUN_PORT" ] && ask_optional FOREIGN_IP "Tunnel allowed from IP" "(blank = any)"
-    # Always enable IPv6 management in ufw - harmless if unused, required for the
-    # goldip.net AAAA whitelist (if any) and any custom IPv6 CDN ranges to take effect.
     [ -f /etc/default/ufw ] && sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw 2>/dev/null
     warn "Resetting firewall..."
     ufw --force reset >/dev/null 2>&1
@@ -921,7 +1067,7 @@ firewall_status() {
     command -v ufw >/dev/null 2>&1 && ufw status verbose || warn "ufw not installed."
 }
 
-# ---------------- Watchdog ----------------
+# ── Watchdog ──────────────────────────────────────────────────────────────
 install_watchdog() {
     cat > /usr/local/bin/goldip-watchdog.sh <<'WEOF'
 #!/bin/bash
@@ -956,7 +1102,7 @@ TEOF
     warn "To stop: systemctl disable --now goldip-watchdog.timer"
 }
 
-# ---------------- Persistence ----------------
+# ── Persistence ───────────────────────────────────────────────────────────
 enable_persistence() {
     local mode="${1:-}"
     if command -v nginx >/dev/null 2>&1; then
@@ -1003,24 +1149,27 @@ XEOF
     fi
 }
 
-# ---------------- Menu ----------------
+# ── Menu ──────────────────────────────────────────────────────────────────
 menu() {
     while true; do
         clear
         echo -e "${TITLE}"; header; echo -e "${RESET}"
-        echo -e "  ${M1}1)${RESET}  Install / Config website"
-        echo -e "  ${M9}2)${RESET}  Start Nginx"
-        echo -e "  ${M3}3)${RESET}  Stop Nginx"
-        echo -e "  ${M4}4)${RESET}  Restart Nginx"
-        echo -e "  ${M5}5)${RESET}  Reload Nginx"
-        echo -e "  ${M7}6)${RESET}  Status"
-        echo -e "  ${M8}7)${RESET}  View logs"
-        echo -e "  ${M2}8)${RESET}  Remove domain config"
-        echo -e "  ${M11}9)${RESET}  Setup firewall"
-        echo -e "  ${M10}10)${RESET} Firewall status"
-        echo -e "  ${M12}11)${RESET} Fix auto-start (persistence)"
-        echo -e "  ${M6}12)${RESET} FULL Nginx uninstall + cleanup"
-        echo -e "  ${M6}0)${RESET}  Exit"
+
+        # Each menu line has its own unique colour. Green/Red only for ok()/err().
+        echo -e "  ${C_ITEM_1}1)${RESET}  ${C_ITEM_1}Install / Config website${RESET}"
+        echo -e "  ${C_ITEM_2}2)${RESET}  ${C_ITEM_2}Start Nginx${RESET}"
+        echo -e "  ${C_ITEM_3}3)${RESET}  ${C_ITEM_3}Stop Nginx${RESET}"
+        echo -e "  ${C_ITEM_4}4)${RESET}  ${C_ITEM_4}Restart Nginx${RESET}"
+        echo -e "  ${C_ITEM_5}5)${RESET}  ${C_ITEM_5}Reload Nginx${RESET}"
+        echo -e "  ${C_ITEM_6}6)${RESET}  ${C_ITEM_6}Status${RESET}"
+        echo -e "  ${C_ITEM_7}7)${RESET}  ${C_ITEM_7}View logs${RESET}"
+        echo -e "  ${C_ITEM_8}8)${RESET}  ${C_ITEM_8}Remove domain config${RESET}"
+        echo -e "  ${C_ITEM_9}9)${RESET}  ${C_ITEM_9}Setup firewall${RESET}"
+        echo -e "  ${C_ITEM_10}10)${RESET} ${C_ITEM_10}Firewall status${RESET}"
+        echo -e "  ${C_ITEM_11}11)${RESET} ${C_ITEM_11}Fix auto-start (persistence)${RESET}"
+        echo -e "  ${C_ITEM_12}12)${RESET} ${C_ITEM_12}FULL Nginx uninstall + cleanup${RESET}"
+        echo -e "  ${C_ITEM_0}0)${RESET}  ${C_ITEM_0}Exit${RESET}"
+
         local CH; ask_optional CH "Choose"
         case "$CH" in
             1)  do_install ;;
@@ -1042,6 +1191,6 @@ menu() {
     done
 }
 
-# ---------------- Entry ----------------
+# ── Entry ─────────────────────────────────────────────────────────────────
 require_root
 menu
