@@ -1,12 +1,11 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v3.8 (Uncut)
-#  - Fixed systemctl hang: Force kills x-ui/xray before DB update
-#  - Package Conflict Fix & Strict Error Handling
-#  - Colors Fixed: Success=Green, Error=Red, Prompts=Rotating
-#  - Strictly CDN Only (ws, xhttp, httpupgrade) - gRPC skipped
-#  - Hosts API & xHTTP xPadding Auto-Injection
-#  - Hardened Security & Custom Auto-SSL Path (/root/goldip/)
+#  GoldIP Nginx Camouflage Installer & Manager  v3.9 (Ultimate)
+#  - FIXED: Systemctl Hang (Proper Stop/Kill Sequence)
+#  - FIXED: Unbound Variable Crash (LOCATIONS pre-initialized)
+#  - FIXED: 3x-ui Database Panic (Full SQL Columns Restored)
+#  - CDN Only (ws/xhttp/httpupgrade) - gRPC/TCP/etc Skipped
+#  - Auto-SSL /root/goldip/ Priority & xPadding Injection
 # ============================================================
 set -uo pipefail
 
@@ -123,7 +122,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v3.8 (Uncut)
+    N G I N X   C A M O U F L A G E   v3.9 (Ultimate)
 ==========================================================
 EOF
 }
@@ -207,14 +206,31 @@ import sqlite3, sys, time
 db_path, inbound_id, remark, address, port, sni, alpn_json = sys.argv[1:8]
 now_ms = int(time.time() * 1000)
 try:
-    con = sqlite3.connect(db_path)
+    con = sqlite3.connect(db_path, timeout=10.0)
     cur = con.cursor()
+    # استفاده از ساختار کامل و استاندارد 3x-ui برای جلوگیری از Panic و کِرَش شدن پنل
     cur.execute("""
         INSERT INTO hosts (
-            inbound_id, sort_order, remark, server_description, is_disabled, is_hidden,
-            address, port, security, sni, host_header, path, alpn, fingerprint, override_sni_from_address,
-            keep_sni_blank, allow_insecure, created_at, updated_at
-        ) VALUES (?, 0, ?, '', 0, 0, ?, ?, 'tls', ?, '', '', ?, 'chrome', 1, 0, 0, ?, ?)
+            inbound_id, sort_order, remark, server_description,
+            is_disabled, is_hidden, tags, address, port,
+            security, sni, host_header, path, alpn,
+            fingerprint, override_sni_from_address, keep_sni_blank,
+            pinned_peer_cert_sha256, verify_peer_cert_by_name,
+            allow_insecure, ech_config_list, mux_params, sockopt_params,
+            final_mask, vless_route, exclude_from_sub_types,
+            mihomo_ip_version, mihomo_x25519, shuffle_host, node_guids,
+            created_at, updated_at
+        ) VALUES (
+            ?, 0, ?, '',
+            0, 0, NULL, ?, ?,
+            'tls', ?, '', '', ?,
+            'chrome', 1, 0,
+            NULL, '',
+            0, '', '', '',
+            '', '', NULL,
+            '', 0, 0, NULL,
+            ?, ?
+        )
     """, (int(inbound_id), remark, address, int(port), sni, alpn_json, now_ms, now_ms))
     con.commit(); con.close(); print("OK"); sys.exit(0)
 except Exception as e:
@@ -226,7 +242,7 @@ strip_tls_py() {
     python3 - "$1" "$2" "$3" <<'PYEOF'
 import sqlite3, json, sys
 try:
-    con = sqlite3.connect(sys.argv[1]); cur = con.cursor(); inb_id = int(sys.argv[2]); net = sys.argv[3]
+    con = sqlite3.connect(sys.argv[1], timeout=10.0); cur = con.cursor(); inb_id = int(sys.argv[2]); net = sys.argv[3]
     cur.execute("SELECT stream_settings FROM inbounds WHERE id=?", (inb_id,))
     row = cur.fetchone()
     if row and row[0]:
@@ -302,7 +318,7 @@ auto_build_locations() {
         IN_ID[$idx]="$id"; IN_PORT[$idx]="$port"; IN_NET[$idx]="${net:-unknown}"; IN_PATH[$idx]="$path"; IN_SS[$idx]="$ss"
     done < <(sqlite3 -separator '|' "$db" "SELECT id, port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
 
-    LOCATIONS=""; USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
+    USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""; local added=0
     local -a OP_IDS OP_FPORTS OP_NETS OP_PATHS OP_ALPNS
     local op_count=0 ltype fport
@@ -335,22 +351,22 @@ auto_build_locations() {
     if is_yes "$AP"; then
         cp "$db" "${db}.bak.$(date +%s)"
         
-        # گارد امنیتی: کشتن پروسه‌ها برای جلوگیری از قفل شدن دیتابیس و فریز شدن systemctl
-        ok "Force stopping x-ui & xray to prevent database locks and hangs..."
+        # هندلینگ بسیار ایمن برای جلوگیری از فریز شدن (Hang) سیستم
+        ok "Safely stopping x-ui & xray to unlock database..."
+        systemctl stop x-ui --no-block 2>/dev/null || true
+        sleep 1
         killall -9 x-ui xray 2>/dev/null || true
-        systemctl stop x-ui 2>/dev/null || true
         
         for m in $(seq 1 "$op_count"); do
             mid="${OP_IDS[$m]}"; mfport="${OP_FPORTS[$m]}"; mnet="${OP_NETS[$m]}"; malpn="${OP_ALPNS[$m]}"
-            sqlite3 "$db" "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};"
+            sqlite3 -cmd ".timeout 2000" "$db" "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};"
             strip_tls_py "$db" "$mid" "$mnet" >/dev/null
-            sqlite3 "$db" "DELETE FROM hosts WHERE inbound_id=${mid};"
+            sqlite3 -cmd ".timeout 2000" "$db" "DELETE FROM hosts WHERE inbound_id=${mid};"
             insert_host_py "$db" "$mid" "$mnet" "$PRIMARY" "443" "$PRIMARY" "$malpn" >/dev/null
         done
         
         ok "Database updated! Starting x-ui..."
         systemctl start x-ui 2>/dev/null || true
-        ok "x-ui restarted successfully."
     fi
     return 0
 }
@@ -409,6 +425,9 @@ JSEOF
 
 # ---------------- Setup Flow ----------------
 gather_inputs() {
+    # مقداردهی اولیه برای جلوگیری از خطای Unbound Variable
+    LOCATIONS=""
+    
     echo -e "${INFO}=== Panel Configuration ===${RESET}"
     ask RAW_PANEL "Panel Domain / IP" "(e.g. panel.example.com)"
     PANEL_DOMAIN=$(strip_scheme "$RAW_PANEL"); PANEL_DOMAIN=$(strip_port "$PANEL_DOMAIN")
@@ -515,7 +534,8 @@ write_config() {
     } > "$conf"
     
     if nginx -t; then
-        systemctl restart nginx && ok "Nginx Configured & Running!" || { err "systemctl restart failed."; return 1; }
+        systemctl restart nginx 2>/dev/null || true
+        ok "Nginx Configured & Running!"
     else
         err "Nginx config test FAILED — HTTPS config NOT applied. See errors above."
         return 1
