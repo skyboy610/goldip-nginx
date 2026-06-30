@@ -2,7 +2,7 @@
 # ============================================================
 #  GoldIP Nginx Camouflage Installer & Manager  v3.3.1
 # ============================================================
-# CHANGELOG (v3.2 - this revision):
+# CHANGELOG (v3.3.1 - this revision):
 #   5) Hardened response headers in the HTTPS server block:
 #      - server_tokens off;  (hides the Nginx version string from
 #        responses/error pages - removes an easy fingerprinting vector)
