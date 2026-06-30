@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v3.2
+#  GoldIP Nginx Camouflage Installer & Manager  v3.3
 # ============================================================
 # CHANGELOG (v3.2 - this revision):
 #   5) Hardened response headers in the HTTPS server block:
