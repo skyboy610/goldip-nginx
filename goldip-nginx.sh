@@ -607,7 +607,7 @@ gather_inputs() {
     detect_xui_ports
 
     echo -e "${INFO}=== Panel Configuration ===${RESET}"
-    ask RAW_PANEL_DOMAIN "Domain Panel" "(e.g. panel.goldip.me or server IP)"
+    ask RAW_PANEL_DOMAIN "Domain Panel" "(e.g. panel.exampel.com or server IP)"
     PANEL_DOMAIN=$(strip_scheme "$RAW_PANEL_DOMAIN")
     PANEL_DOMAIN=$(strip_port "$PANEL_DOMAIN")
     ask_port PANEL_PORT "Panel Port" "${XUI_PANEL_PORT_DETECTED:-2053}"
@@ -615,7 +615,7 @@ gather_inputs() {
     ok "Panel: ${PANEL_DOMAIN}:${PANEL_PORT}"
 
     echo -e "${INFO}=== CDN Configuration ===${RESET}"
-    ask RAW_CDN_DOMAIN "CDN Domain" "(e.g. tu.goldip.me)"
+    ask RAW_CDN_DOMAIN "CDN Domain" "(e.g. cdn.example.com)"
     CDN_DOMAIN=$(strip_scheme "$RAW_CDN_DOMAIN")
     PRIMARY="$CDN_DOMAIN"
     ok "CDN domain: ${CDN_DOMAIN}"
