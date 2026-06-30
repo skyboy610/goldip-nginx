@@ -1,11 +1,18 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v3.9 (Ultimate)
-#  - FIXED: Systemctl Hang (Proper Stop/Kill Sequence)
-#  - FIXED: Unbound Variable Crash (LOCATIONS pre-initialized)
-#  - FIXED: 3x-ui Database Panic (Full SQL Columns Restored)
-#  - CDN Only (ws/xhttp/httpupgrade) - gRPC/TCP/etc Skipped
-#  - Auto-SSL /root/goldip/ Priority & xPadding Injection
+#  GoldIP Nginx Camouflage Installer & Manager  v3.7 (Uncut)
+#  - FIX (v3.7): nginx-extras now installed correctly from the
+#    start (no more silent apt conflict that left http_sub_module
+#    missing -> nginx -t failing -> HTTPS config never applied,
+#    site stuck serving the OLD/HTTP-only config silently).
+#  - FIX (v3.7): write_config no longer swallows nginx -t errors;
+#    failures are printed and propagate up (do_install aborts).
+#  - FIX (v3.7): "listen ... ssl http2;" replaced with version-
+#    aware syntax (nginx >=1.25.1 uses separate "http2 on;").
+#  - Colors Fixed: Success=Green, Error=Red, Prompts=Rotating
+#  - Strictly CDN Only (ws, xhttp, httpupgrade) - gRPC skipped
+#  - Hosts API & xHTTP xPadding Auto-Injection
+#  - Hardened Security & Custom Auto-SSL Path (/root/goldip/)
 # ============================================================
 set -uo pipefail
 
@@ -16,7 +23,7 @@ M9='\033[1;92m'; M10='\033[1;93m'; M11='\033[1;94m'; M12='\033[1;91m'
 TITLE='\033[1;36m'; INFO='\033[1;34m'
 OK_BG='\033[42m\033[97m'; WARN_BG='\033[43m\033[97m'; ERR_BG='\033[41m\033[97m'
 
-PALETTE=(M1 M2 M3 M4 M5 M7 M8 M9 M10 M11)
+PALETTE=(M1 M2 M3 M4 M5 M7 M8 M9 M10 M11) # رنگ قرمز حذف شد تا فقط برای ارور بماند
 __cidx=0
 CURCOLOR=""
 nextcolor() {
@@ -25,6 +32,7 @@ nextcolor() {
     CURCOLOR="${!name}"
 }
 
+# پیام‌های وضعیت با رنگ ثابت (سبز، زرد، قرمز)
 ok()   { echo -e "${OK_BG} OK ${RESET} \033[1;32m$1${RESET}"; }
 warn() { echo -e "${WARN_BG} WARN ${RESET} \033[1;33m$1${RESET}"; }
 err()  { echo -e "${ERR_BG} ERROR ${RESET} \033[1;31m$1${RESET}"; }
@@ -39,7 +47,7 @@ ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.11
 ARVAN_V6_DEFAULT=""
 CF_V4=""; CF_V6=""; ARVAN_V4=""; ARVAN_V6=""
 
-# ---------------- Input helpers ----------------
+# ---------------- Input helpers (با رنگ چرخشی) ----------------
 ask() {
     local __var="$1" __q="$2" __hint="${3:-}" __ans __c
     while true; do
@@ -122,7 +130,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v3.9 (Ultimate)
+    N G I N X   C A M O U F L A G E   v3.7 (Uncut)
 ==========================================================
 EOF
 }
@@ -131,23 +139,41 @@ require_root() { [ "$(id -u)" -eq 0 ] || { err "Run this script as root."; exit 
 
 ensure_sqlite3() { command -v sqlite3 >/dev/null 2>&1 || apt-get install -y sqlite3 >/dev/null 2>&1; }
 
+# ---------------- FIX v3.7: install nginx WITH http_sub_module from the start ----------------
+# Root cause of "HTTPS never comes up, site stays on HTTP only":
+#   the old script installed plain `nginx`, then LATER tried to silently
+#   `apt-get install nginx-extras` inside write_config. nginx-core/nginx-light
+#   and nginx-extras CONFLICT in apt, so that late install failed silently
+#   (output redirected to /dev/null). http_sub_module never got installed,
+#   nginx -t failed because of sub_filter/sub_filter_once directives, and
+#   systemctl restart nginx was therefore never called -> the HTTPS server
+#   block (with your Cloudflare cert) never actually loaded.
 install_nginx() {
     if command -v nginx >/dev/null 2>&1; then
-        nginx -V 2>&1 | grep -q 'http_sub_module' && { ok "Nginx (with sub_module) already installed."; return 0; }
-        warn "Nginx installed but missing http_sub_module — will fix below."
+        if nginx -V 2>&1 | grep -q 'http_sub_module'; then
+            ok "Nginx already installed (with http_sub_module)."
+            return 0
+        fi
+        warn "Nginx is installed but missing http_sub_module. Reinstalling as nginx-extras..."
     fi
+
     apt-get update -y >/dev/null 2>&1
+
+    # حذف نسخه‌های کانفلیکت‌دار قبل از نصب نسخه extras (و الا apt ساکت fail می‌کند)
     apt-get remove -y nginx nginx-core nginx-light nginx-full nginx-common >/dev/null 2>&1
+    apt-get autoremove -y >/dev/null 2>&1
+
     if apt-get install -y nginx-extras > /tmp/goldip_nginx_install.log 2>&1; then
-        ok "Nginx (extras, with sub_module) installed."
+        ok "Nginx (extras build, includes http_sub_module) installed."
     else
-        err "nginx-extras install failed. Log: /tmp/goldip_nginx_install.log"
-        cat /tmp/goldip_nginx_install.log
-        return 1
+        err "Failed to install nginx-extras. Last 20 lines of apt log:"
+        tail -n 20 /tmp/goldip_nginx_install.log
+        exit 1
     fi
+
     nginx -V 2>&1 | grep -q 'http_sub_module' || {
-        err "http_sub_module still missing after install. Aborting — camouflage block needs sub_filter."
-        return 1
+        err "http_sub_module STILL missing after install. The camouflage block (sub_filter) cannot work. Aborting."
+        exit 1
     }
 }
 
@@ -206,31 +232,14 @@ import sqlite3, sys, time
 db_path, inbound_id, remark, address, port, sni, alpn_json = sys.argv[1:8]
 now_ms = int(time.time() * 1000)
 try:
-    con = sqlite3.connect(db_path, timeout=10.0)
+    con = sqlite3.connect(db_path)
     cur = con.cursor()
-    # استفاده از ساختار کامل و استاندارد 3x-ui برای جلوگیری از Panic و کِرَش شدن پنل
     cur.execute("""
         INSERT INTO hosts (
-            inbound_id, sort_order, remark, server_description,
-            is_disabled, is_hidden, tags, address, port,
-            security, sni, host_header, path, alpn,
-            fingerprint, override_sni_from_address, keep_sni_blank,
-            pinned_peer_cert_sha256, verify_peer_cert_by_name,
-            allow_insecure, ech_config_list, mux_params, sockopt_params,
-            final_mask, vless_route, exclude_from_sub_types,
-            mihomo_ip_version, mihomo_x25519, shuffle_host, node_guids,
-            created_at, updated_at
-        ) VALUES (
-            ?, 0, ?, '',
-            0, 0, NULL, ?, ?,
-            'tls', ?, '', '', ?,
-            'chrome', 1, 0,
-            NULL, '',
-            0, '', '', '',
-            '', '', NULL,
-            '', 0, 0, NULL,
-            ?, ?
-        )
+            inbound_id, sort_order, remark, server_description, is_disabled, is_hidden,
+            address, port, security, sni, host_header, path, alpn, fingerprint, override_sni_from_address,
+            keep_sni_blank, allow_insecure, created_at, updated_at
+        ) VALUES (?, 0, ?, '', 0, 0, ?, ?, 'tls', ?, '', '', ?, 'chrome', 1, 0, 0, ?, ?)
     """, (int(inbound_id), remark, address, int(port), sni, alpn_json, now_ms, now_ms))
     con.commit(); con.close(); print("OK"); sys.exit(0)
 except Exception as e:
@@ -242,7 +251,7 @@ strip_tls_py() {
     python3 - "$1" "$2" "$3" <<'PYEOF'
 import sqlite3, json, sys
 try:
-    con = sqlite3.connect(sys.argv[1], timeout=10.0); cur = con.cursor(); inb_id = int(sys.argv[2]); net = sys.argv[3]
+    con = sqlite3.connect(sys.argv[1]); cur = con.cursor(); inb_id = int(sys.argv[2]); net = sys.argv[3]
     cur.execute("SELECT stream_settings FROM inbounds WHERE id=?", (inb_id,))
     row = cur.fetchone()
     if row and row[0]:
@@ -269,10 +278,12 @@ find_certificate_for_domain() {
     local domain; domain=$(strip_port "${1:-}")
     [ -n "$domain" ] || return 1
     
+    # اولویت اول: مسیر اختصاصی
     if [ -f "/root/goldip/cert.pem" ] && [ -f "/root/goldip/key.pem" ]; then
         printf '%s|%s' "/root/goldip/cert.pem" "/root/goldip/key.pem"; return 0
     fi
     
+    # اولویت‌های بعدی
     if [ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]; then
         printf '%s|%s' "/etc/letsencrypt/live/${domain}/fullchain.pem" "/etc/letsencrypt/live/${domain}/privkey.pem"; return 0
     fi
@@ -318,7 +329,7 @@ auto_build_locations() {
         IN_ID[$idx]="$id"; IN_PORT[$idx]="$port"; IN_NET[$idx]="${net:-unknown}"; IN_PATH[$idx]="$path"; IN_SS[$idx]="$ss"
     done < <(sqlite3 -separator '|' "$db" "SELECT id, port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
 
-    USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
+    LOCATIONS=""; USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""; local added=0
     local -a OP_IDS OP_FPORTS OP_NETS OP_PATHS OP_ALPNS
     local op_count=0 ltype fport
@@ -326,6 +337,7 @@ auto_build_locations() {
     for n in $(seq 1 "$idx"); do
         net="${IN_NET[$n]}"; port="${IN_PORT[$n]}"; path="${IN_PATH[$n]}"; id="${IN_ID[$n]}"
         
+        # گارد امنیتی: فقط و فقط پروتکل‌های مجاز CDN وارد انجین‌اکس می‌شوند
         case "$net" in
             ws|httpupgrade) ltype="upgrade" ;;
             xhttp|splithttp) ltype="xhttp" ;;
@@ -350,23 +362,14 @@ auto_build_locations() {
     local AP; ask_optional AP "Apply DB changes (Inject xPadding + Rebuild Hosts)?" "[y/N]"
     if is_yes "$AP"; then
         cp "$db" "${db}.bak.$(date +%s)"
-        
-        # هندلینگ بسیار ایمن برای جلوگیری از فریز شدن (Hang) سیستم
-        ok "Safely stopping x-ui & xray to unlock database..."
-        systemctl stop x-ui --no-block 2>/dev/null || true
-        sleep 1
-        killall -9 x-ui xray 2>/dev/null || true
-        
         for m in $(seq 1 "$op_count"); do
             mid="${OP_IDS[$m]}"; mfport="${OP_FPORTS[$m]}"; mnet="${OP_NETS[$m]}"; malpn="${OP_ALPNS[$m]}"
-            sqlite3 -cmd ".timeout 2000" "$db" "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};"
+            sqlite3 "$db" "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};"
             strip_tls_py "$db" "$mid" "$mnet" >/dev/null
-            sqlite3 -cmd ".timeout 2000" "$db" "DELETE FROM hosts WHERE inbound_id=${mid};"
+            sqlite3 "$db" "DELETE FROM hosts WHERE inbound_id=${mid};"
             insert_host_py "$db" "$mid" "$mnet" "$PRIMARY" "443" "$PRIMARY" "$malpn" >/dev/null
         done
-        
-        ok "Database updated! Starting x-ui..."
-        systemctl start x-ui 2>/dev/null || true
+        ok "Database updated! Restarting x-ui..."; systemctl restart x-ui
     fi
     return 0
 }
@@ -425,9 +428,6 @@ JSEOF
 
 # ---------------- Setup Flow ----------------
 gather_inputs() {
-    # مقداردهی اولیه برای جلوگیری از خطای Unbound Variable
-    LOCATIONS=""
-    
     echo -e "${INFO}=== Panel Configuration ===${RESET}"
     ask RAW_PANEL "Panel Domain / IP" "(e.g. panel.example.com)"
     PANEL_DOMAIN=$(strip_scheme "$RAW_PANEL"); PANEL_DOMAIN=$(strip_port "$PANEL_DOMAIN")
@@ -451,6 +451,32 @@ gather_inputs() {
     else
         ask_file SSL_CERT "Cert Path (fullchain)"; ask_file SSL_KEY "Key Path (privkey)"
     fi
+
+    # FIX v3.7: validate the cert/key actually load BEFORE writing the nginx
+    # config, so a bad Cloudflare cert/key pair fails loudly here instead of
+    # silently leaving the site on HTTP only.
+    if ! openssl x509 -in "$SSL_CERT" -noout >/dev/null 2>&1; then
+        err "SSL_CERT (${SSL_CERT}) is not a valid certificate file (openssl could not parse it)."
+        exit 1
+    fi
+    if ! openssl pkey -in "$SSL_KEY" -noout >/dev/null 2>&1 && ! openssl rsa -in "$SSL_KEY" -noout >/dev/null 2>&1; then
+        err "SSL_KEY (${SSL_KEY}) is not a valid private key file (openssl could not parse it)."
+        exit 1
+    fi
+    CERT_MODULUS=$(openssl x509 -in "$SSL_CERT" -noout -modulus 2>/dev/null | openssl md5)
+    KEY_MODULUS=$(openssl pkey -in "$SSL_KEY" -pubout 2>/dev/null | openssl md5)
+    # Note: modulus comparison above only works directly for RSA keys via
+    # `openssl rsa`; for EC keys this check is skipped rather than producing
+    # a false failure.
+    if openssl rsa -in "$SSL_KEY" -noout -modulus >/dev/null 2>&1; then
+        KEY_MODULUS=$(openssl rsa -in "$SSL_KEY" -noout -modulus 2>/dev/null | openssl md5)
+        if [ "$CERT_MODULUS" != "$KEY_MODULUS" ]; then
+            err "SSL_CERT and SSL_KEY do NOT match (modulus mismatch). Double-check you copied the correct Cloudflare cert + key pair."
+            exit 1
+        fi
+    fi
+    ok "Certificate and key validated successfully."
+
     ensure_cert_renew_hook "$SSL_CERT"
 
     ask_optional BEHIND_CF "Behind Cloudflare CDN? (restore real visitor IP)" "[y/N]"
@@ -460,6 +486,7 @@ gather_inputs() {
     
     [ "$DISC" = "1" ] && { auto_build_locations || warn "Auto-build failed or skipped. Switching to manual."; }
     
+    # تنظیم دستی - gRPC از گزینه‌ها حذف شده
     if [ "$DISC" = "2" ] || [ -z "$LOCATIONS" ]; then
         ask_number NIN "How many CDN inbounds to add to Nginx?"
         local i=1
@@ -494,12 +521,41 @@ gather_inputs() {
     fi
 }
 
+# ---------------- FIX v3.7: nginx version-aware http2 syntax ----------------
+# nginx >= 1.25.1 deprecated "listen ... ssl http2;" in favor of a separate
+# "http2 on;" directive. The old combined form still works (warning only,
+# not a hard error) but this removes the warning and future-proofs the conf.
+version_ge() {
+    [ "$1" = "$2" ] && return 0
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]
+}
+detect_http2_syntax() {
+    local v
+    v=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+    if [ -n "$v" ] && version_ge "$v" "1.25.1"; then
+        HTTP2_LISTEN_SUFFIX=""
+        HTTP2_DIRECTIVE="    http2 on;"
+    else
+        HTTP2_LISTEN_SUFFIX=" http2"
+        HTTP2_DIRECTIVE=""
+    fi
+}
+
 write_config() {
     mkdir -p "$NGINX_CONF_DIR"
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null
     rm -f /etc/nginx/conf.d/default.conf 2>/dev/null
 
     is_yes "${BEHIND_CF:-}" && write_cf_realip
+
+    # FIX v3.7: http_sub_module is now guaranteed present by install_nginx()
+    # at the top of do_install(). No more silent re-install attempt here.
+    nginx -V 2>&1 | grep -q 'http_sub_module' || {
+        err "http_sub_module is missing. Run option 1 again (it reinstalls nginx-extras) before continuing."
+        return 1
+    }
+
+    detect_http2_syntax
 
     local conf="${NGINX_CONF_DIR}/${PRIMARY}.conf"
     {
@@ -510,7 +566,8 @@ write_config() {
         echo "}"
         echo ""
         echo "server {"
-        echo "    listen ${HTTPS_PORT} ssl http2;"
+        echo "    listen ${HTTPS_PORT} ssl${HTTP2_LISTEN_SUFFIX};"
+        [ -n "$HTTP2_DIRECTIVE" ] && echo "$HTTP2_DIRECTIVE"
         echo "    server_name ${CDN_DOMAIN};"
         echo "    ssl_certificate     ${SSL_CERT};"
         echo "    ssl_certificate_key ${SSL_KEY};"
@@ -532,12 +589,20 @@ write_config() {
         echo "    ${CAMO_BLOCK}"
         echo "}"
     } > "$conf"
-    
+
+    # FIX v3.7: never swallow nginx -t output again. Show it, and fail loudly
+    # (return 1) if the config is broken, instead of silently leaving the
+    # previous (HTTP-only) config active.
     if nginx -t; then
-        systemctl restart nginx 2>/dev/null || true
-        ok "Nginx Configured & Running!"
+        if systemctl restart nginx; then
+            ok "Nginx Configured & Running on HTTPS (${HTTPS_PORT})!"
+        else
+            err "nginx -t passed but 'systemctl restart nginx' failed. Run: systemctl status nginx -l"
+            return 1
+        fi
     else
-        err "Nginx config test FAILED — HTTPS config NOT applied. See errors above."
+        err "nginx -t FAILED (see errors above). HTTPS config was written to ${conf} but NOT activated."
+        err "The site is still running on whatever config was active before — likely why you're seeing HTTP only."
         return 1
     fi
 }
@@ -636,6 +701,7 @@ setup_firewall() {
         XUI_PORTS=$(printf '%s\n' "${pport} ${sport} ${iports}" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)
     fi
 
+    # Allow TCP & UDP for X-ui
     for p in $XUI_PORTS; do
         [ -z "$p" ] && continue
         ufw allow "${p}/tcp" >/dev/null 2>&1
@@ -752,7 +818,7 @@ full_uninstall() {
     rm -f /etc/systemd/system/goldip-watchdog.* /usr/local/bin/goldip-watchdog.sh
     rm -rf /etc/systemd/system/nginx.service.d
     systemctl daemon-reload >/dev/null 2>&1
-    apt-get purge -y nginx nginx-core nginx-light nginx-full nginx-extras nginx-common 2>/dev/null || true
+    apt-get purge -y nginx nginx-common nginx-full nginx-extras nginx-core 2>/dev/null || true
     apt-get autoremove -y 2>/dev/null || true
     rm -rf /etc/nginx /var/log/nginx /var/www/goldip
     ok "Nginx fully uninstalled."
@@ -798,15 +864,17 @@ svc() {
 show_status() {
     systemctl is-active --quiet nginx && ok "Nginx is ACTIVE" || err "Nginx is INACTIVE"
     systemctl is-active --quiet x-ui && ok "x-ui is ACTIVE" || err "x-ui is INACTIVE"
+    echo -e "${INFO}--- Listening ports (80/443) ---${RESET}"
+    ss -tlnp 2>/dev/null | grep -E ':80 |:443 ' || warn "Nothing listening on 80/443."
     nginx -t 2>&1
 }
 
 # ---------------- Main Menu ----------------
 do_install() {
-    install_nginx || { err "Install aborted due to nginx configuration/package failure."; return 1; }
+    install_nginx || return 1
     ensure_sqlite3
     gather_inputs
-    write_config || { err "Install aborted due to nginx config failure."; return 1; }
+    write_config || { err "Install ABORTED: nginx config did not pass nginx -t / restart. Site left on previous config. Scroll up for the exact error."; return 1; }
     enable_persistence silent
 }
 
