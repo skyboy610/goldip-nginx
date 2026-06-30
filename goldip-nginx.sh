@@ -1,6 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v3.6 (Uncut)
+#  GoldIP Nginx Camouflage Installer & Manager  v3.7 (Uncut)
+#  - Package Conflict Fix & Strict Error Handling
 #  - Colors Fixed: Success=Green, Error=Red, Prompts=Rotating
 #  - Strictly CDN Only (ws, xhttp, httpupgrade) - gRPC skipped
 #  - Hosts API & xHTTP xPadding Auto-Injection
@@ -15,7 +16,7 @@ M9='\033[1;92m'; M10='\033[1;93m'; M11='\033[1;94m'; M12='\033[1;91m'
 TITLE='\033[1;36m'; INFO='\033[1;34m'
 OK_BG='\033[42m\033[97m'; WARN_BG='\033[43m\033[97m'; ERR_BG='\033[41m\033[97m'
 
-PALETTE=(M1 M2 M3 M4 M5 M7 M8 M9 M10 M11) # رنگ قرمز حذف شد تا فقط برای ارور بماند
+PALETTE=(M1 M2 M3 M4 M5 M7 M8 M9 M10 M11)
 __cidx=0
 CURCOLOR=""
 nextcolor() {
@@ -24,7 +25,6 @@ nextcolor() {
     CURCOLOR="${!name}"
 }
 
-# پیام‌های وضعیت با رنگ ثابت (سبز، زرد، قرمز)
 ok()   { echo -e "${OK_BG} OK ${RESET} \033[1;32m$1${RESET}"; }
 warn() { echo -e "${WARN_BG} WARN ${RESET} \033[1;33m$1${RESET}"; }
 err()  { echo -e "${ERR_BG} ERROR ${RESET} \033[1;31m$1${RESET}"; }
@@ -39,7 +39,7 @@ ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.11
 ARVAN_V6_DEFAULT=""
 CF_V4=""; CF_V6=""; ARVAN_V4=""; ARVAN_V6=""
 
-# ---------------- Input helpers (با رنگ چرخشی) ----------------
+# ---------------- Input helpers ----------------
 ask() {
     local __var="$1" __q="$2" __hint="${3:-}" __ans __c
     while true; do
@@ -122,7 +122,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v3.6 (Uncut)
+    N G I N X   C A M O U F L A G E   v3.7 (Uncut)
 ==========================================================
 EOF
 }
@@ -132,8 +132,24 @@ require_root() { [ "$(id -u)" -eq 0 ] || { err "Run this script as root."; exit 
 ensure_sqlite3() { command -v sqlite3 >/dev/null 2>&1 || apt-get install -y sqlite3 >/dev/null 2>&1; }
 
 install_nginx() {
-    command -v nginx >/dev/null 2>&1 && { ok "Nginx already installed."; return 0; }
-    apt-get update -y >/dev/null 2>&1 && apt-get install -y nginx >/dev/null 2>&1 || err "Nginx install failed."
+    if command -v nginx >/dev/null 2>&1; then
+        nginx -V 2>&1 | grep -q 'http_sub_module' && { ok "Nginx (with sub_module) already installed."; return 0; }
+        warn "Nginx installed but missing http_sub_module — will fix below."
+    fi
+    apt-get update -y >/dev/null 2>&1
+    # حذف ایمن نسخه‌های کانفلیکت‌دار قبل از نصب nginx-extras
+    apt-get remove -y nginx nginx-core nginx-light nginx-full nginx-common >/dev/null 2>&1
+    if apt-get install -y nginx-extras > /tmp/goldip_nginx_install.log 2>&1; then
+        ok "Nginx (extras, with sub_module) installed."
+    else
+        err "nginx-extras install failed. Log: /tmp/goldip_nginx_install.log"
+        cat /tmp/goldip_nginx_install.log
+        return 1
+    fi
+    nginx -V 2>&1 | grep -q 'http_sub_module' || {
+        err "http_sub_module still missing after install. Aborting — camouflage block needs sub_filter."
+        return 1
+    }
 }
 
 # ---------------- Location Builder ----------------
@@ -419,7 +435,7 @@ gather_inputs() {
     
     [ "$DISC" = "1" ] && { auto_build_locations || warn "Auto-build failed or skipped. Switching to manual."; }
     
-    # تنظیم دستی - gRPC از گزینه‌ها حذف شده
+    # تنظیم دستی
     if [ "$DISC" = "2" ] || [ -z "$LOCATIONS" ]; then
         ask_number NIN "How many CDN inbounds to add to Nginx?"
         local i=1
@@ -461,10 +477,6 @@ write_config() {
 
     is_yes "${BEHIND_CF:-}" && write_cf_realip
 
-    nginx -V 2>&1 | grep -q 'http_sub_module' || {
-        apt-get install -y nginx-extras >/dev/null 2>&1
-    }
-
     local conf="${NGINX_CONF_DIR}/${PRIMARY}.conf"
     {
         echo "server {"
@@ -497,7 +509,12 @@ write_config() {
         echo "}"
     } > "$conf"
     
-    nginx -t && systemctl restart nginx && ok "Nginx Configured & Running!" || err "Nginx test failed."
+    if nginx -t; then
+        systemctl restart nginx && ok "Nginx Configured & Running!" || { err "systemctl restart failed."; return 1; }
+    else
+        err "Nginx config test FAILED — HTTPS config NOT applied. See errors above."
+        return 1
+    fi
 }
 
 # ---------------- Real IP / CDN Ranges ----------------
@@ -711,7 +728,7 @@ full_uninstall() {
     rm -f /etc/systemd/system/goldip-watchdog.* /usr/local/bin/goldip-watchdog.sh
     rm -rf /etc/systemd/system/nginx.service.d
     systemctl daemon-reload >/dev/null 2>&1
-    apt-get purge -y nginx nginx-common nginx-full nginx-extras nginx-core 2>/dev/null || true
+    apt-get purge -y nginx nginx-core nginx-light nginx-full nginx-extras nginx-common 2>/dev/null || true
     apt-get autoremove -y 2>/dev/null || true
     rm -rf /etc/nginx /var/log/nginx /var/www/goldip
     ok "Nginx fully uninstalled."
@@ -761,7 +778,13 @@ show_status() {
 }
 
 # ---------------- Main Menu ----------------
-do_install() { install_nginx; ensure_sqlite3; gather_inputs; write_config || return 1; enable_persistence silent; }
+do_install() {
+    install_nginx || { err "Install aborted due to nginx configuration/package failure."; return 1; }
+    ensure_sqlite3
+    gather_inputs
+    write_config || { err "Install aborted due to nginx config failure."; return 1; }
+    enable_persistence silent
+}
 
 menu() {
     while true; do
