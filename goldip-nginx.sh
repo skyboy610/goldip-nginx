@@ -1,11 +1,10 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v3.5 (Uncut)
-#  - Hosts API (No externalProxy) & Hosts Cleanup
-#  - xHTTP xPadding Auto-Injection
-#  - gRPC / Hysteria / TCP / UDP Full Support
-#  - Hardened Nginx Security Headers & Auto-SSL
-#  - Full Management Tools & Manual Mode Restored
+#  GoldIP Nginx Camouflage Installer & Manager  v3.6 (Uncut)
+#  - Colors Fixed: Success=Green, Error=Red, Prompts=Rotating
+#  - Strictly CDN Only (ws, xhttp, httpupgrade) - gRPC skipped
+#  - Hosts API & xHTTP xPadding Auto-Injection
+#  - Hardened Security & Custom Auto-SSL Path (/root/goldip/)
 # ============================================================
 set -uo pipefail
 
@@ -16,7 +15,7 @@ M9='\033[1;92m'; M10='\033[1;93m'; M11='\033[1;94m'; M12='\033[1;91m'
 TITLE='\033[1;36m'; INFO='\033[1;34m'
 OK_BG='\033[42m\033[97m'; WARN_BG='\033[43m\033[97m'; ERR_BG='\033[41m\033[97m'
 
-PALETTE=(M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 M12)
+PALETTE=(M1 M2 M3 M4 M5 M7 M8 M9 M10 M11) # رنگ قرمز حذف شد تا فقط برای ارور بماند
 __cidx=0
 CURCOLOR=""
 nextcolor() {
@@ -25,9 +24,10 @@ nextcolor() {
     CURCOLOR="${!name}"
 }
 
-ok()   { nextcolor; echo -e "${OK_BG} OK ${RESET}${CURCOLOR} $1${RESET}"; }
-warn() { nextcolor; echo -e "${WARN_BG} WARN ${RESET}${CURCOLOR} $1${RESET}"; }
-err()  { nextcolor; echo -e "${ERR_BG} ERROR ${RESET}${CURCOLOR} $1${RESET}"; }
+# پیام‌های وضعیت با رنگ ثابت (سبز، زرد، قرمز)
+ok()   { echo -e "${OK_BG} OK ${RESET} \033[1;32m$1${RESET}"; }
+warn() { echo -e "${WARN_BG} WARN ${RESET} \033[1;33m$1${RESET}"; }
+err()  { echo -e "${ERR_BG} ERROR ${RESET} \033[1;31m$1${RESET}"; }
 
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 CAMO_ROOT="/var/www/goldip"
@@ -39,7 +39,7 @@ ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.11
 ARVAN_V6_DEFAULT=""
 CF_V4=""; CF_V6=""; ARVAN_V4=""; ARVAN_V6=""
 
-# ---------------- Input helpers ----------------
+# ---------------- Input helpers (با رنگ چرخشی) ----------------
 ask() {
     local __var="$1" __q="$2" __hint="${3:-}" __ans __c
     while true; do
@@ -122,7 +122,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v3.5 (Uncut)
+    N G I N X   C A M O U F L A G E   v3.6 (Uncut)
 ==========================================================
 EOF
 }
@@ -140,18 +140,7 @@ install_nginx() {
 make_location() {
     local t="$1" p="$2" port="$3"
     [ "${p:0:1}" != "/" ] && p="/$p"
-    if [ "$t" = "grpc" ]; then
-        printf '    location %s {\n' "$p"
-        printf '        grpc_pass grpc://127.0.0.1:%s;\n' "$port"
-        printf '        grpc_set_header X-Real-IP $remote_addr;\n'
-        printf '        grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
-        printf '        grpc_set_header X-Forwarded-Proto $scheme;\n'
-        printf '        grpc_set_header Host $host;\n'
-        printf '        grpc_read_timeout 1h;\n'
-        printf '        grpc_send_timeout 1h;\n'
-        printf '        client_max_body_size 0;\n'
-        printf '    }\n'
-    elif [ "$t" = "xhttp" ]; then
+    if [ "$t" = "xhttp" ]; then
         printf '    location %s {\n' "$p"
         printf '        proxy_pass http://127.0.0.1:%s;\n' "$port"
         printf '        proxy_http_version 1.1;\n'
@@ -191,7 +180,6 @@ free_port() {
 # ---------------- Database Python Scripts ----------------
 alpn_for_net() {
     case "$1" in
-        grpc) printf '["h2"]' ;;
         xhttp|splithttp) printf '["http/1.1","h2"]' ;;
         *) printf '["http/1.1"]' ;;
     esac
@@ -248,6 +236,13 @@ PYEOF
 find_certificate_for_domain() {
     local domain; domain=$(strip_port "${1:-}")
     [ -n "$domain" ] || return 1
+    
+    # اولویت اول: مسیر اختصاصی
+    if [ -f "/root/goldip/cert.pem" ] && [ -f "/root/goldip/key.pem" ]; then
+        printf '%s|%s' "/root/goldip/cert.pem" "/root/goldip/key.pem"; return 0
+    fi
+    
+    # اولویت‌های بعدی
     if [ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]; then
         printf '%s|%s' "/etc/letsencrypt/live/${domain}/fullchain.pem" "/etc/letsencrypt/live/${domain}/privkey.pem"; return 0
     fi
@@ -287,28 +282,25 @@ auto_build_locations() {
     while IFS='|' read -r id port ss; do
         [ -n "$port" ] || continue
         net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
-        if [ "$net" = "grpc" ]; then
-            rawpath=$(printf '%s' "$ss" | grep -oE '"serviceName"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
-        else
-            rawpath=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
-        fi
+        rawpath=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         path="${rawpath%%\?*}"
         idx=$((idx+1))
         IN_ID[$idx]="$id"; IN_PORT[$idx]="$port"; IN_NET[$idx]="${net:-unknown}"; IN_PATH[$idx]="$path"; IN_SS[$idx]="$ss"
     done < <(sqlite3 -separator '|' "$db" "SELECT id, port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
 
     LOCATIONS=""; USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
-    TAKEN_PORTS=""; local added=0 skipped=0
+    TAKEN_PORTS=""; local added=0
     local -a OP_IDS OP_FPORTS OP_NETS OP_PATHS OP_ALPNS
     local op_count=0 ltype fport
 
     for n in $(seq 1 "$idx"); do
         net="${IN_NET[$n]}"; port="${IN_PORT[$n]}"; path="${IN_PATH[$n]}"; id="${IN_ID[$n]}"
+        
+        # گارد امنیتی: فقط و فقط پروتکل‌های مجاز CDN وارد انجین‌اکس می‌شوند
         case "$net" in
             ws|httpupgrade) ltype="upgrade" ;;
             xhttp|splithttp) ltype="xhttp" ;;
-            grpc) ltype="grpc" ;;
-            *) skipped=$((skipped+1)); ok "Skipped non-CDN protocol: ${net} (Port ${port})"; continue ;;
+            *) ok "Skipped non-CDN protocol: ${net} (Port ${port})"; continue ;;
         esac
 
         [ -z "$path" ] || [ "$path" = "/" ] && continue
@@ -427,22 +419,21 @@ gather_inputs() {
     
     [ "$DISC" = "1" ] && { auto_build_locations || warn "Auto-build failed or skipped. Switching to manual."; }
     
-    # Restore Manual Mode Loop
+    # تنظیم دستی - gRPC از گزینه‌ها حذف شده
     if [ "$DISC" = "2" ] || [ -z "$LOCATIONS" ]; then
         ask_number NIN "How many CDN inbounds to add to Nginx?"
         local i=1
         while [ "$i" -le "$NIN" ]; do
             echo -e "${INFO}--- Inbound #${i} ---${RESET}"
-            ask P_PATH "Path / ServiceName" "(e.g. /ws${i} or my-grpc-svc)"
+            ask P_PATH "Path" "(e.g. /ws${i})"
             [ "${P_PATH:0:1}" = "/" ] || P_PATH="/$P_PATH"
             ask_number P_PORT "Local Xray port"
             echo -e "${INFO}Transport:${RESET}"
-            echo -e "  ${M1}1)${RESET} WebSocket / HTTPUpgrade  ${M2}2)${RESET} XHTTP  ${M3}3)${RESET} gRPC"
-            ask_choice P_TYPE "Selection" "1|2|3"
+            echo -e "  ${M1}1)${RESET} WebSocket / HTTPUpgrade  ${M2}2)${RESET} XHTTP"
+            ask_choice P_TYPE "Selection" "1|2"
             case "$P_TYPE" in
                 1) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location upgrade "$P_PATH" "$P_PORT")" ;;
                 2) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location xhttp "$P_PATH" "$P_PORT")" ;;
-                3) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location grpc "$P_PATH" "$P_PORT")" ;;
             esac
             i=$((i+1))
         done
@@ -591,7 +582,6 @@ setup_firewall() {
     ufw --force reset >/dev/null; ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null
     ufw allow "${SSH_PORT}/tcp" >/dev/null
     
-    # Restore Whitelist GoldIP function call
     whitelist_goldip
     
     local XUI_PORTS="" xdb=""
@@ -604,7 +594,7 @@ setup_firewall() {
         XUI_PORTS=$(printf '%s\n' "${pport} ${sport} ${iports}" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)
     fi
 
-    # Allow TCP & UDP for X-ui (Hysteria fix)
+    # Allow TCP & UDP for X-ui
     for p in $XUI_PORTS; do
         [ -z "$p" ] && continue
         ufw allow "${p}/tcp" >/dev/null 2>&1
@@ -711,7 +701,7 @@ XEOF
 
 # ---------------- Uninstall & Logs ----------------
 full_uninstall() {
-    echo -e "${ERR_BG} WARNING ${RESET} This will COMPLETELY remove Nginx and all configs!"
+    echo -e "${ERR_BG} WARNING ${RESET} \033[1;31mThis will COMPLETELY remove Nginx and all configs!\033[0m"
     local CONFIRM; ask_optional CONFIRM "Type YES to confirm"
     [ "$CONFIRM" = "YES" ] || { warn "Cancelled."; return; }
     systemctl stop nginx 2>/dev/null || true
@@ -737,9 +727,9 @@ colorize_access_line() {
     local line="$1" code
     code=$(printf '%s' "$line" | grep -oE '" [1-5][0-9][0-9] ' | head -n1 | tr -dc '0-9')
     case "$code" in
-        5*) echo -e "${ERR_BG} ${code} ${RESET} $line" ;;
-        4*) echo -e "${WARN_BG} ${code} ${RESET} $line" ;;
-        2*|3*) echo -e "${OK_BG} ${code} ${RESET} $line" ;;
+        5*) echo -e "${ERR_BG} ${code} ${RESET} \033[1;31m$line\033[0m" ;;
+        4*) echo -e "${WARN_BG} ${code} ${RESET} \033[1;33m$line\033[0m" ;;
+        2*|3*) echo -e "${OK_BG} ${code} ${RESET} \033[1;32m$line\033[0m" ;;
         *) echo -e "${M8}$line${RESET}" ;;
     esac
 }
@@ -786,7 +776,7 @@ menu() {
         echo -e "  ${M9}8)  Remove domain config"
         echo -e "  ${M11}9)  Setup firewall"
         echo -e "  ${M10}10) Firewall status"
-        echo -e "  ${M12}11) Fix auto-start (persistence)"
+        echo -e "  ${M1}11) Fix auto-start (persistence)"
         echo -e "  ${M6}12) FULL Nginx uninstall + cleanup"
         echo -e "  ${M6}0)  Exit"
         local CH; ask_optional CH "Choose"
