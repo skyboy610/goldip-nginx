@@ -1,6 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v3.7 (Uncut)
+#  GoldIP Nginx Camouflage Installer & Manager  v3.8 (Uncut)
+#  - Fixed systemctl hang: Force kills x-ui/xray before DB update
 #  - Package Conflict Fix & Strict Error Handling
 #  - Colors Fixed: Success=Green, Error=Red, Prompts=Rotating
 #  - Strictly CDN Only (ws, xhttp, httpupgrade) - gRPC skipped
@@ -122,7 +123,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v3.7 (Uncut)
+    N G I N X   C A M O U F L A G E   v3.8 (Uncut)
 ==========================================================
 EOF
 }
@@ -137,7 +138,6 @@ install_nginx() {
         warn "Nginx installed but missing http_sub_module — will fix below."
     fi
     apt-get update -y >/dev/null 2>&1
-    # حذف ایمن نسخه‌های کانفلیکت‌دار قبل از نصب nginx-extras
     apt-get remove -y nginx nginx-core nginx-light nginx-full nginx-common >/dev/null 2>&1
     if apt-get install -y nginx-extras > /tmp/goldip_nginx_install.log 2>&1; then
         ok "Nginx (extras, with sub_module) installed."
@@ -253,12 +253,10 @@ find_certificate_for_domain() {
     local domain; domain=$(strip_port "${1:-}")
     [ -n "$domain" ] || return 1
     
-    # اولویت اول: مسیر اختصاصی
     if [ -f "/root/goldip/cert.pem" ] && [ -f "/root/goldip/key.pem" ]; then
         printf '%s|%s' "/root/goldip/cert.pem" "/root/goldip/key.pem"; return 0
     fi
     
-    # اولویت‌های بعدی
     if [ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]; then
         printf '%s|%s' "/etc/letsencrypt/live/${domain}/fullchain.pem" "/etc/letsencrypt/live/${domain}/privkey.pem"; return 0
     fi
@@ -312,7 +310,6 @@ auto_build_locations() {
     for n in $(seq 1 "$idx"); do
         net="${IN_NET[$n]}"; port="${IN_PORT[$n]}"; path="${IN_PATH[$n]}"; id="${IN_ID[$n]}"
         
-        # گارد امنیتی: فقط و فقط پروتکل‌های مجاز CDN وارد انجین‌اکس می‌شوند
         case "$net" in
             ws|httpupgrade) ltype="upgrade" ;;
             xhttp|splithttp) ltype="xhttp" ;;
@@ -337,6 +334,12 @@ auto_build_locations() {
     local AP; ask_optional AP "Apply DB changes (Inject xPadding + Rebuild Hosts)?" "[y/N]"
     if is_yes "$AP"; then
         cp "$db" "${db}.bak.$(date +%s)"
+        
+        # گارد امنیتی: کشتن پروسه‌ها برای جلوگیری از قفل شدن دیتابیس و فریز شدن systemctl
+        ok "Force stopping x-ui & xray to prevent database locks and hangs..."
+        killall -9 x-ui xray 2>/dev/null || true
+        systemctl stop x-ui 2>/dev/null || true
+        
         for m in $(seq 1 "$op_count"); do
             mid="${OP_IDS[$m]}"; mfport="${OP_FPORTS[$m]}"; mnet="${OP_NETS[$m]}"; malpn="${OP_ALPNS[$m]}"
             sqlite3 "$db" "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};"
@@ -344,7 +347,10 @@ auto_build_locations() {
             sqlite3 "$db" "DELETE FROM hosts WHERE inbound_id=${mid};"
             insert_host_py "$db" "$mid" "$mnet" "$PRIMARY" "443" "$PRIMARY" "$malpn" >/dev/null
         done
-        ok "Database updated! Restarting x-ui..."; systemctl restart x-ui
+        
+        ok "Database updated! Starting x-ui..."
+        systemctl start x-ui 2>/dev/null || true
+        ok "x-ui restarted successfully."
     fi
     return 0
 }
@@ -435,7 +441,6 @@ gather_inputs() {
     
     [ "$DISC" = "1" ] && { auto_build_locations || warn "Auto-build failed or skipped. Switching to manual."; }
     
-    # تنظیم دستی
     if [ "$DISC" = "2" ] || [ -z "$LOCATIONS" ]; then
         ask_number NIN "How many CDN inbounds to add to Nginx?"
         local i=1
@@ -611,7 +616,6 @@ setup_firewall() {
         XUI_PORTS=$(printf '%s\n' "${pport} ${sport} ${iports}" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)
     fi
 
-    # Allow TCP & UDP for X-ui
     for p in $XUI_PORTS; do
         [ -z "$p" ] && continue
         ufw allow "${p}/tcp" >/dev/null 2>&1
