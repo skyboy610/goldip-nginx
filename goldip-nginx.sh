@@ -494,7 +494,7 @@ gather_inputs() {
     echo -e "${M4}=== Domain Configuration ===${RESET}"
 
     # FIX: Ask Panel Domain and Panel Port first, then CDN Domain
-    ask RAW_PANEL_DOMAIN "Domain Panel" "(e.g. panel.goldip.me)"
+    ask RAW_PANEL_DOMAIN "Domain Panel" "(e.g. panel.example.com)"
     PANEL_DOMAIN=$(strip_scheme "$RAW_PANEL_DOMAIN")
 
     # DB search directory helper
@@ -506,7 +506,7 @@ gather_inputs() {
 
     ask_port XUI_PANEL_PORT "Panel Port" "${XUI_PANEL_PORT:-2053}"
 
-    ask RAW_CDN_DOMAIN "CDN Domain" "(e.g. tu.goldip.me)"
+    ask RAW_CDN_DOMAIN "CDN Domain" "(e.g. cdn.example.com)"
     CDN_DOMAIN=$(strip_scheme "$RAW_CDN_DOMAIN")
     PRIMARY="$CDN_DOMAIN"
 
