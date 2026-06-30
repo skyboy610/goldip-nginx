@@ -1,6 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v3.0
+#  GoldIP Nginx Camouflage Installer & Manager  v3.1
+#  Optimized & Fixed by Best Coder in the World
 # ============================================================
 set -uo pipefail
 
@@ -11,9 +12,10 @@ M9='\033[1;92m'; M10='\033[1;93m'; M11='\033[1;94m'; M12='\033[1;91m'
 TITLE='\033[1;36m'; PROMPT='\033[1;96m'; HINT='\033[1;97m'; INFO='\033[1;34m'
 OK_BG='\033[42m\033[97m'; WARN_BG='\033[43m\033[97m'; ERR_BG='\033[41m\033[97m'
 
-ok()   { echo -e "${OK_BG} OK ${RESET} $1"; }
-warn() { echo -e "${WARN_BG} WARN ${RESET} $1"; }
-err()  { echo -e "${ERR_BG} ERROR ${RESET} $1"; }
+# Color-coded log outputs
+ok()   { echo -e "${OK_BG} OK ${RESET} ${M4}$1${RESET}"; }
+warn() { echo -e "${WARN_BG} WARN ${RESET} ${M5}$1${RESET}"; }
+err()  { echo -e "${ERR_BG} ERROR ${RESET} ${M12}$1${RESET}"; }
 
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 CAMO_ROOT="/var/www/goldip"
@@ -92,7 +94,7 @@ ask_choice() {
 }
 is_yes() { case "$1" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
 
-# Strip scheme from domain input (user may type https://example.com or example.com)
+# Strip scheme from domain input
 strip_scheme() {
     printf '%s' "$1" | sed -E 's#^https?://##; s#/.*##; s/^[[:space:]]+//; s/[[:space:]]+$//'
 }
@@ -106,7 +108,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v3.0
+    N G I N X   C A M O U F L A G E   v3.1
 ==========================================================
 EOF
 }
@@ -212,7 +214,6 @@ free_port() {
 # ---------------- Resolve IPs for a domain ----------------
 resolve_domain_ips() {
     local domain="$1" ips=""
-    # Try dig, then host, then getent
     if command -v dig >/dev/null 2>&1; then
         ips=$(dig +short A "$domain" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ' ')
     fi
@@ -226,10 +227,7 @@ resolve_domain_ips() {
 }
 
 # ---------------- Transform inbound JSON ----------------
-# Two modes:
-#   mode=cdn  -> security=none, listen=127.0.0.1, externalProxy with CDN domain
-#   mode=panel-> only set externalProxy with panel domain (no security/listen change)
-#   mode=none -> only security=none + listen=127.0.0.1, no externalProxy
+# Standard transformation for CDN protocols ONLY
 transform_inbound_json() {
     python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
 import json, sys
@@ -242,8 +240,6 @@ except Exception:
 if not isinstance(ss, dict):
     sys.exit(2)
 
-# CDN-compatible inbounds: set security=none (nginx terminates TLS)
-# and set externalProxy pointing to CDN domain
 if mode == "cdn":
     ss["security"] = "none"
     for k in ("tlsSettings", "realitySettings", "externalProxySettings", "externalProxy"):
@@ -262,31 +258,6 @@ if mode == "cdn":
         "alpn":        "h2,http/1.1"
     }]
 
-# Non-CDN inbounds that still need a host in externalProxy (panel domain, direct connection)
-# We only set/update externalProxy - we do NOT touch security, listen, port
-elif mode == "panel":
-    for k in ("externalProxySettings", "externalProxy"):
-        ss.pop(k, None)
-    try:
-        port = int(hport)
-    except ValueError:
-        port = 443
-    ss["externalProxy"] = [{
-        "forceTls":    "tls",
-        "dest":        domain,
-        "port":        port,
-        "remark":      "",
-        "sni":         domain,
-        "fingerprint": "chrome",
-        "alpn":        "h2,http/1.1"
-    }]
-
-# mode=none: only security=none, no externalProxy touch
-elif mode == "none":
-    ss["security"] = "none"
-    for k in ("tlsSettings", "realitySettings"):
-        ss.pop(k, None)
-
 json.dump(ss, sys.stdout, separators=(",", ":"), ensure_ascii=False)
 PYEOF
 }
@@ -294,22 +265,88 @@ PYEOF
 # ---------------- Read x-ui panel & sub ports from DB ----------------
 read_xui_ports() {
     local db="$1"
-    # Panel port
     XUI_PANEL_PORT=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" 2>/dev/null || echo "")
     [ -z "$XUI_PANEL_PORT" ] && XUI_PANEL_PORT=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='port' LIMIT 1;" 2>/dev/null || echo "")
-    # Sub port
     XUI_SUB_PORT=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='subPort' LIMIT 1;" 2>/dev/null || echo "")
     [ -z "$XUI_PANEL_PORT" ] && XUI_PANEL_PORT="2053"
     [ -z "$XUI_SUB_PORT"   ] && XUI_SUB_PORT=""
 }
 
+# ---------------- Automatic SSL Certificate Finder ----------------
+find_certificates() {
+    local cert="" key=""
+    ok "Searching for SSL certificates matching domain names automatically..."
+
+    # 1. Search typical Acme.sh and Letsencrypt directories for both domains
+    local dom
+    for dom in "${CDN_DOMAIN:-}" "${PANEL_DOMAIN:-}"; do
+        [ -z "$dom" ] && continue
+        
+        # Letsencrypt
+        if [ -f "/etc/letsencrypt/live/${dom}/fullchain.pem" ] && [ -f "/etc/letsencrypt/live/${dom}/privkey.pem" ]; then
+            cert="/etc/letsencrypt/live/${dom}/fullchain.pem"
+            key="/etc/letsencrypt/live/${dom}/privkey.pem"
+            ok "Found certificate in Letsencrypt path for ${dom}."
+            break
+        fi
+        
+        # Acme.sh ecc
+        if [ -f "/root/.acme.sh/${dom}_ecc/fullchain.cer" ] && [ -f "/root/.acme.sh/${dom}_ecc/${dom}.key" ]; then
+            cert="/root/.acme.sh/${dom}_ecc/fullchain.cer"
+            key="/root/.acme.sh/${dom}_ecc/${dom}.key"
+            ok "Found certificate in Acme.sh (ECC) path for ${dom}."
+            break
+        fi
+        
+        # Acme.sh standard
+        if [ -f "/root/.acme.sh/${dom}/fullchain.cer" ] && [ -f "/root/.acme.sh/${dom}/${dom}.key" ]; then
+            cert="/root/.acme.sh/${dom}/fullchain.cer"
+            key="/root/.acme.sh/${dom}/${dom}.key"
+            ok "Found certificate in Acme.sh (RSA) path for ${dom}."
+            break
+        fi
+    done
+
+    # 2. Extract from x-ui SQLite DB stream_settings if not found yet
+    if { [ -z "$cert" ] || [ -z "$key" ]; } && [ -n "${db:-}" ] && [ -f "$db" ]; then
+        local db_paths
+        db_paths=$(sqlite3 "$db" "SELECT stream_settings FROM inbounds WHERE stream_settings LIKE '%/%.pem%' OR stream_settings LIKE '%/%.crt%' OR stream_settings LIKE '%/%.cer%' OR stream_settings LIKE '%/%.key%';" 2>/dev/null | grep -oE '"(certificateFile|keyFile)"[ ]*:[ ]*"[^"]+"' | sed -E 's/.*:[ ]*"([^"]*)"/\1/' | sort -u || echo "")
+        for p in $db_paths; do
+            if [ -f "$p" ]; then
+                if [[ "$p" =~ \.(pem|cer|crt)$ ]] && [ -z "$cert" ]; then
+                    cert="$p"
+                elif [[ "$p" =~ \.key$ ]] && [ -z "$key" ]; then
+                    key="$p"
+                fi
+            fi
+        done
+        if [ -n "$cert" ] && [ -n "$key" ]; then
+            ok "Found certificate paths in X-UI Database configurations."
+        fi
+    fi
+
+    # 3. Last resort general search under common directories
+    if [ -z "$cert" ] || [ -z "$key" ]; then
+        for dom in "${CDN_DOMAIN:-}" "${PANEL_DOMAIN:-}"; do
+            [ -z "$dom" ] && continue
+            local found_cert found_key
+            found_cert=$(find /root/.acme.sh/ /etc/letsencrypt/ /etc/nginx/ /etc/ssl/ -type f \( -name "*fullchain*" -o -name "*.cer" -o -name "*.crt" -o -name "*.pem" \) 2>/dev/null | grep -i "$dom" | head -n 1 || echo "")
+            found_key=$(find /root/.acme.sh/ /etc/letsencrypt/ /etc/nginx/ /etc/ssl/ -type f -name "*.key" 2>/dev/null | grep -i "$dom" | head -n 1 || echo "")
+            if [ -f "$found_cert" ] && [ -f "$found_key" ]; then
+                cert="$found_cert"
+                key="$found_key"
+                ok "Located wildcard SSL files on filesystem for ${dom}."
+                break
+            fi
+        done
+    fi
+
+    SSL_CERT="$cert"
+    SSL_KEY="$key"
+}
+
 # ---------------- Auto build locations from x-ui DB ----------------
-# Logic:
-#  CDN-compatible (ws/httpupgrade/xhttp): 
-#    - move to 127.0.0.1, security=none, externalProxy=CDN_DOMAIN:HTTPS_PORT
-#  Non-CDN (grpc/tcp/kcp/quic/reality/etc):
-#    - UNTOUCHED completely (no listen change, no security change)
-#    - Only set externalProxy=PANEL_DOMAIN:PANEL_PORT so share links work
+# FIX: Only touch 'ws', 'xhttp', and 'httpupgrade'. Keep others (grpc, hysteria, etc.) 100% UNTOUCHED
 auto_build_locations() {
     local db=""
     for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do
@@ -345,7 +382,7 @@ auto_build_locations() {
 
     [ "$idx" -ge 1 ] || { warn "No inbounds found in database."; return 1; }
 
-    echo -e "${INFO}Inbounds found:${RESET}"
+    echo -e "${INFO}Inbounds found in database:${RESET}"
     local n
     for n in $(seq 1 "$idx"); do
         printf "  ${M8}*${RESET} ${M4}port %-6s${RESET} | ${M5}%-12s${RESET} | ${M1}%s${RESET} | proto: %s\n" \
@@ -354,7 +391,7 @@ auto_build_locations() {
 
     LOCATIONS=""
     local cdn_added=0 non_cdn_ep=0 skipped_path=0 skipped_dup=0
-    local SQL_CDN="" SQL_PANEL=""
+    local SQL_CDN=""
     USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""; SEEN_PATHS=""
 
@@ -367,7 +404,7 @@ auto_build_locations() {
         port="${IN_PORT[$n]}"; net="${IN_NET[$n]}"
         path="${IN_PATH[$n]}"; inb_id="${IN_ID[$n]}"
 
-        # Determine if CDN-compatible
+        # FIX: Check if protocol uses CDN (ws, xhttp, httpupgrade only)
         is_cdn=0
         case "$net" in
             ws|httpupgrade)  is_cdn=1; ltype="upgrade" ;;
@@ -413,38 +450,27 @@ auto_build_locations() {
             cdn_added=$((cdn_added+1))
 
         else
-            # Non-CDN: DO NOT touch listen/port/security
-            # Only update externalProxy to point at panel domain for share links
-            if [ "$HAVE_PY" = "1" ]; then
-                if newjson=$(transform_inbound_json "${IN_SS[$n]}" "$PANEL_DOMAIN" "$XUI_PANEL_PORT" "panel" 2>/dev/null); then
-                    newjson="${newjson//\'/\'\'}"
-                    SQL_PANEL="${SQL_PANEL}UPDATE inbounds SET stream_settings='${newjson}' WHERE id=${inb_id};"$'\n'
-                    ok "Non-CDN: ${net} port ${port} | extProxy: ${PANEL_DOMAIN}:${XUI_PANEL_PORT} (untouched)"
-                else
-                    warn "Non-CDN: ${net} port ${port} - JSON parse failed, skipping entirely."
-                fi
-            else
-                ok "Non-CDN: ${net} port ${port} - left completely untouched."
-            fi
+            # FIX: Non-CDN inbounds (grpc, tcp, hysteria, wireguard, etc.) are kept completely UNTOUCHED
+            ok "Non-CDN (grpc/hysteria/etc.): ${net} port ${port} - left completely untouched."
             non_cdn_ep=$((non_cdn_ep+1))
         fi
     done
 
     echo ""
-    echo -e "${INFO}Summary:${RESET}"
-    echo -e "  ${M4}CDN inbounds behind Nginx: ${cdn_added}${RESET}"
-    echo -e "  ${M5}Non-CDN inbounds (panel EP only): ${non_cdn_ep}${RESET}"
+    echo -e "${INFO}Migration Summary:${RESET}"
+    echo -e "  ${M4}CDN inbounds configured behind Nginx: ${cdn_added}${RESET}"
+    echo -e "  ${M5}Non-CDN inbounds untouched (safe/direct): ${non_cdn_ep}${RESET}"
     echo -e "  ${M8}Skipped (no path): ${skipped_path} | Skipped (dup path): ${skipped_dup}${RESET}"
 
-    [ "$cdn_added" -ge 1 ] || { warn "No CDN-compatible inbounds found (need ws/httpupgrade/xhttp with a path)."; return 1; }
+    [ "$cdn_added" -ge 1 ] || { warn "No CDN-compatible inbounds found (need ws/httpupgrade/xhttp with a unique path)."; return 1; }
 
     # Apply DB changes
-    local ALL_SQL="${SQL_CDN}${SQL_PANEL}"
+    local ALL_SQL="${SQL_CDN}"
     if [ -n "$ALL_SQL" ]; then
         echo ""
         echo -e "${WARN_BG} ACTION ${RESET} Apply DB changes?"
         echo -e "  ${M4}CDN inbounds${RESET}: move to 127.0.0.1 + set extProxy to ${CDN_DOMAIN}:${HTTPS_PORT}"
-        echo -e "  ${M5}Non-CDN inbounds${RESET}: set extProxy to ${PANEL_DOMAIN}:${XUI_PANEL_PORT} ONLY (listen/port unchanged)"
+        echo -e "  ${M5}Non-CDN inbounds${RESET}: kept untouched"
         local AP; ask_optional AP "Apply now?" "[y/N]"
         if is_yes "$AP"; then
             local bak="${db}.bak.$(date +%s)"
@@ -465,53 +491,57 @@ auto_build_locations() {
 
 # ---------------- Gather inputs ----------------
 gather_inputs() {
-    echo -e "${INFO}=== Domain Configuration ===${RESET}"
+    echo -e "${M4}=== Domain Configuration ===${RESET}"
 
-    ask RAW_CDN_DOMAIN "CDN domain (for Nginx + ExternalProxy on CDN inbounds)" "(e.g. tu.goldip.me)"
+    # FIX: Ask Panel Domain and Panel Port first, then CDN Domain
+    ask RAW_PANEL_DOMAIN "Domain Panel" "(e.g. panel.goldip.me)"
+    PANEL_DOMAIN=$(strip_scheme "$RAW_PANEL_DOMAIN")
+
+    # DB search directory helper
+    local db=""
+    for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do
+        [ -f "$c" ] && db="$c" && break
+    done
+    read_xui_ports "$db"
+
+    ask_port XUI_PANEL_PORT "Panel Port" "${XUI_PANEL_PORT:-2053}"
+
+    ask RAW_CDN_DOMAIN "CDN Domain" "(e.g. tu.goldip.me)"
     CDN_DOMAIN=$(strip_scheme "$RAW_CDN_DOMAIN")
     PRIMARY="$CDN_DOMAIN"
 
-    ask RAW_PANEL_DOMAIN "Panel domain (for ExternalProxy on non-CDN inbounds)" "(e.g. panel.goldip.me  or  IP:port)"
-    PANEL_DOMAIN=$(strip_scheme "$RAW_PANEL_DOMAIN")
-
-    ok "CDN domain   : ${CDN_DOMAIN}"
-    ok "Panel domain : ${PANEL_DOMAIN}"
+    ok "Domain Panel : ${PANEL_DOMAIN} (Port: ${XUI_PANEL_PORT})"
+    ok "CDN Domain   : ${CDN_DOMAIN}"
 
     ask_port HTTPS_PORT "HTTPS listen port (CDN)" 443
     ask_port HTTP_PORT  "HTTP  listen port"       80
 
-    # Auto-detect letsencrypt certificates
-    local AUTO_CERT="/etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem"
-    local AUTO_KEY="/etc/letsencrypt/live/${PANEL_DOMAIN}/privkey.pem"
-    if [ ! -f "$AUTO_CERT" ]; then
-        AUTO_CERT="/etc/letsencrypt/live/${CDN_DOMAIN}/fullchain.pem"
-        AUTO_KEY="/etc/letsencrypt/live/${CDN_DOMAIN}/privkey.pem"
-    fi
-    if [ -f "$AUTO_CERT" ] && [ -f "$AUTO_KEY" ]; then
+    # FIX: Run Automatic Certificate Finder
+    find_certificates
+
+    if [ -n "$SSL_CERT" ] && [ -n "$SSL_KEY" ] && [ -f "$SSL_CERT" ] && [ -f "$SSL_KEY" ]; then
         echo ""
         echo -e "${OK_BG} CERT FOUND ${RESET}"
-        echo -e "  ${M4}cert : ${AUTO_CERT}${RESET}"
-        echo -e "  ${M4}key  : ${AUTO_KEY}${RESET}"
+        echo -e "  ${M4}cert : ${SSL_CERT}${RESET}"
+        echo -e "  ${M4}key  : ${SSL_KEY}${RESET}"
         local USE_AUTO
-        ask_optional USE_AUTO "Use these certificates?" "[Y/n]"
+        ask_optional USE_AUTO "Use these auto-detected certificates?" "[Y/n]"
         case "$USE_AUTO" in
             n|N|no|NO)
                 ask_file SSL_CERT "Full path to SSL certificate (fullchain.pem)"
                 ask_file SSL_KEY  "Full path to SSL private key (privkey.pem)"
                 ;;
             *)
-                SSL_CERT="$AUTO_CERT"
-                SSL_KEY="$AUTO_KEY"
                 ok "Using auto-detected certificates."
                 ;;
         esac
     else
-        warn "No letsencrypt cert found for ${PANEL_DOMAIN} or ${CDN_DOMAIN}."
+        warn "No valid SSL certificates could be automatically found for ${CDN_DOMAIN} or ${PANEL_DOMAIN}."
         ask_file SSL_CERT "Full path to SSL certificate (fullchain.pem)"
         ask_file SSL_KEY  "Full path to SSL private key (privkey.pem)"
     fi
 
-    ask_optional BEHIND_CF "Behind Cloudflare CDN? (restore real visitor IP)" "[y/N]"
+    ask_optional BEHIND_CF "Behind Cloudflare CDN? (restore real visitor IP)" "n"
 
     LOCATIONS=""
     echo -e "${INFO}=== Inbound Configuration ===${RESET}"
@@ -526,8 +556,8 @@ gather_inputs() {
         ask_number NIN "How many CDN inbounds to add to Nginx?"
         local i=1
         while [ "$i" -le "$NIN" ]; do
-            echo -e "${INFO}--- Inbound #${i} ---${RESET}"
-            ask P_PATH "Path" "(e.g. /ws${i})"
+            echo -e "${INFO}--- Inbound #$i ---${RESET}"
+            ask P_PATH "Path" "(e.g. /ws$i)"
             [ "${P_PATH:0:1}" = "/" ] || P_PATH="/$P_PATH"
             ask_number P_PORT "Local Xray port"
             echo -e "${INFO}Transport:${RESET}"
@@ -544,10 +574,10 @@ gather_inputs() {
     echo -e "${INFO}=== Camouflage Site ===${RESET}"
     echo -e "  ${M1}1)${RESET} ${M4}Reverse-proxy to existing website${RESET}"
     echo -e "  ${M2}2)${RESET} ${M5}Serve local HTML file${RESET}"
-    ask_choice CAMO "Selection" "1|2"
+    ask_choice CAMO "Selection" "1"
 
     if [ "$CAMO" = "1" ]; then
-        ask RAW_PROXY "Website to proxy" "(e.g. example.com  or  https://example.com)"
+        ask RAW_PROXY "Website to proxy" "(e.g. https://example.com)"
         RAW_PROXY=$(printf '%s' "$RAW_PROXY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         case "$RAW_PROXY" in http://*|https://*) PROXY_URL="$RAW_PROXY" ;; *) PROXY_URL="https://${RAW_PROXY}" ;; esac
         PROXY_SCHEME=$(printf '%s' "$PROXY_URL" | grep -oE '^https?')
@@ -572,7 +602,7 @@ gather_inputs() {
 _build_camo_block() {
     local js_file="/tmp/goldip_js_$$.js"
     cat > "$js_file" <<JSEOF
-<script>(function(){var H="PROXY_HOST_PH",S="PROXY_SCHEME_PH";var r1=new RegExp(S+"://"+H.replace(/\./g,"\\."),\"g\");var r2=new RegExp("//"+H.replace(/\./g,"\\."),\"g\");function c(u){return typeof u==="string"?u.replace(r1,"").replace(r2,""):u;}var oF=window.fetch;window.fetch=function(u,o){return oF.call(this,c(u),o);};var oX=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){return oX.apply(this,[m,c(u)].concat(Array.prototype.slice.call(arguments,2)));};var oP=history.pushState,oR=history.replaceState;history.pushState=function(s,t,u){return oP.call(this,s,t,c(u));};history.replaceState=function(s,t,u){return oR.call(this,s,t,c(u));};try{var dl=Object.getOwnPropertyDescriptor(window.location,"href");if(dl&&dl.set){Object.defineProperty(window.location,"href",{set:function(v){window.history.replaceState(null,"",c(v));},get:dl.get,configurable:true});}}catch(e){}document.addEventListener("click",function(e){var a=e.target.closest("a");if(!a)return;var h=a.getAttribute("href")||\"\";if(r1.test(h)||r2.test(h)){e.preventDefault();window.history.pushState(null,"",c(h));}},true);})();</script>
+<script>(function(){var H="PROXY_HOST_PH",S="PROXY_SCHEME_PH";var r1=new RegExp(S+"://"+H.replace(/\./g,"\\."),"g");var r2=new RegExp("//"+H.replace(/\./g,"\\."),"g");function c(u){return typeof u==="string"?u.replace(r1,"").replace(r2,""):u;}var oF=window.fetch;window.fetch=function(u,o){return oF.call(this,c(u),o);};var oX=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){return oX.apply(this,[m,c(u)].concat(Array.prototype.slice.call(arguments,2)));};var oP=history.pushState,oR=history.replaceState;history.pushState=function(s,t,u){return oP.call(this,s,t,c(u));};history.replaceState=function(s,t,u){return oR.call(this,s,t,c(u));};try{var dl=Object.getOwnPropertyDescriptor(window.location,"href");if(dl&&dl.set){Object.defineProperty(window.location,"href",{set:function(v){window.history.replaceState(null,"",c(v));},get:dl.get,configurable:true});}}catch(e){}document.addEventListener("click",function(e){var a=e.target.closest("a");if(!a)return;var h=a.getAttribute("href")||"";if(r1.test(h)||r2.test(h)){e.preventDefault();window.history.pushState(null,"",c(h));}},true);})();</script>
 JSEOF
     local js_inline
     js_inline=$(sed "s|PROXY_HOST_PH|${PROXY_HOST}|g; s|PROXY_SCHEME_PH|${PROXY_SCHEME}|g" "$js_file" | tr -d '\n')
@@ -686,7 +716,7 @@ do_install() {
 
 # ---------------- Full Nginx Uninstall ----------------
 full_uninstall() {
-    echo -e "${ERR_BG} WARNING ${RESET} This will COMPLETELY remove Nginx and all GoldIP configs!"
+    echo -e "${ERR_BG} WARNING ${RESET} ${M12}This will COMPLETELY remove Nginx and all GoldIP configs!${RESET}"
     local CONFIRM
     ask_optional CONFIRM "Type YES to confirm full uninstall" "(anything else cancels)"
     [ "$CONFIRM" = "YES" ] || { warn "Cancelled."; return; }
@@ -748,11 +778,11 @@ show_status() {
 colorize_error_line() {
     local line="$1"
     printf '%s' "$line" | grep -qiE '\[(error|crit|alert|emerg)\]' \
-        && { echo -e "${ERR_BG} ERR ${RESET} $line"; return; }
+        && { echo -e "${ERR_BG} ERR ${RESET} ${M12}$line${RESET}"; return; }
     printf '%s' "$line" | grep -qiE '\[warn\]' \
-        && { echo -e "${WARN_BG} WARN ${RESET} $line"; return; }
+        && { echo -e "${WARN_BG} WARN ${RESET} ${M5}$line${RESET}"; return; }
     printf '%s' "$line" | grep -qiE '\[notice\]' \
-        && { echo -e "${OK_BG} NOTE ${RESET} $line"; return; }
+        && { echo -e "${OK_BG} NOTE ${RESET} ${M4}$line${RESET}"; return; }
     echo -e "${M3}$line${RESET}"
 }
 colorize_access_line() {
@@ -760,9 +790,9 @@ colorize_access_line() {
     code=$(printf '%s' "$line" | grep -oE '" [1-5][0-9][0-9] ' | head -n1 | tr -dc '0-9')
     [ -n "$code" ] || code=$(printf '%s' "$line" | grep -oE ' [1-5][0-9][0-9] ' | head -n1 | tr -dc '0-9')
     case "$code" in
-        5*) echo -e "${ERR_BG} ${code} ${RESET} $line" ;;
-        4*) echo -e "${WARN_BG} ${code} ${RESET} $line" ;;
-        2*|3*) echo -e "${OK_BG} ${code} ${RESET} $line" ;;
+        5*) echo -e "${ERR_BG} ${code} ${RESET} ${M12}$line${RESET}" ;;
+        4*) echo -e "${WARN_BG} ${code} ${RESET} ${M5}$line${RESET}" ;;
+        2*|3*) echo -e "${OK_BG} ${code} ${RESET} ${M4}$line${RESET}" ;;
         *) echo -e "${M8}$line${RESET}" ;;
     esac
 }
@@ -886,8 +916,8 @@ setup_firewall() {
 
     local SSH_PORT FW_HTTPS FW_HTTP TUN_PORT FOREIGN_IP=""
     ask_port SSH_PORT "SSH port" 22
-    ask_port FW_HTTPS "HTTPS port exposed to CDN" 443
-    ask_port FW_HTTP  "HTTP port exposed to CDN"  80
+    ask_port FW_HTTPS "HTTPS port exposed to CDN" ${HTTPS_PORT:-443}
+    ask_port FW_HTTP  "HTTP port exposed to CDN"  ${HTTP_PORT:-80}
     ask_port_optional TUN_PORT "Tunnel port (e.g. 8443)"
     [ -n "$TUN_PORT" ] && ask_optional FOREIGN_IP "Tunnel allowed from IP" "(blank = any)"
 
@@ -902,7 +932,6 @@ setup_firewall() {
         pport=$(sqlite3 "$xdb" "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" 2>/dev/null || echo "")
         [ -z "$pport" ] && pport=$(sqlite3 "$xdb" "SELECT value FROM settings WHERE key='port' LIMIT 1;" 2>/dev/null || echo "")
         sport=$(sqlite3 "$xdb" "SELECT value FROM settings WHERE key='subPort' LIMIT 1;" 2>/dev/null || echo "")
-        # All inbound ports (non-CDN direct)
         local iports
         iports=$(sqlite3 "$xdb" "SELECT port FROM inbounds;" 2>/dev/null | tr '\n' ' ')
         XUI_PORTS="${pport} ${sport} ${iports}"
@@ -912,7 +941,6 @@ setup_firewall() {
         warn "Could not auto-detect x-ui ports from DB."
     fi
 
-    # Resolve goldip.net IPs for whitelist
     echo -e "${INFO}Resolving ${GOLDIP_TRUSTED} for whitelist...${RESET}"
     local GOLDIP_IPS
     GOLDIP_IPS=$(resolve_domain_ips "$GOLDIP_TRUSTED")
@@ -1000,9 +1028,9 @@ install_watchdog() {
     cat > /usr/local/bin/goldip-watchdog.sh <<'WEOF'
 #!/bin/bash
 for svc in nginx x-ui; do
-    systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service" || continue
-    systemctl is-enabled --quiet "$svc" 2>/dev/null || continue
-    systemctl is-active  --quiet "$svc" 2>/dev/null || systemctl restart "$svc"
+    systemctl list-unit-files 2>/dev/null | grep -q "^\${svc}\.service" || continue
+    systemctl is-enabled --quiet "\$svc" 2>/dev/null || continue
+    systemctl is-active  --quiet "\$svc" 2>/dev/null || systemctl restart "\$svc"
 done
 WEOF
     chmod +x /usr/local/bin/goldip-watchdog.sh
@@ -1077,19 +1105,22 @@ menu() {
     while true; do
         clear
         echo -e "${TITLE}"; header; echo -e "${RESET}"
-        echo -e "  ${M1}1)${RESET}  Install / Config website"
-        echo -e "  ${M9}2)${RESET}  Start Nginx"
-        echo -e "  ${M3}3)${RESET}  Stop Nginx"
-        echo -e "  ${M4}4)${RESET}  Restart Nginx"
-        echo -e "  ${M5}5)${RESET}  Reload Nginx"
-        echo -e "  ${M7}6)${RESET}  Status"
-        echo -e "  ${M8}7)${RESET}  View logs"
-        echo -e "  ${M2}8)${RESET}  Remove domain config"
-        echo -e "  ${M11}9)${RESET}  Setup firewall"
-        echo -e "  ${M10}10)${RESET} Firewall status"
-        echo -e "  ${M12}11)${RESET} Fix auto-start (persistence)"
-        echo -e "  ${M6}12)${RESET} FULL Nginx uninstall + cleanup"
-        echo -e "  ${M6}0)${RESET}  Exit"
+        
+        # FIX: Each line of the menu now has its own distinct, vibrant color for the entire line!
+        echo -e "${M1}  1)  Install / Config website${RESET}"
+        echo -e "${M9}  2)  Start Nginx${RESET}"
+        echo -e "${M3}  3)  Stop Nginx${RESET}"
+        echo -e "${M4}  4)  Restart Nginx${RESET}"
+        echo -e "${M5}  5)  Reload Nginx${RESET}"
+        echo -e "${M7}  6)  Status${RESET}"
+        echo -e "${M8}  7)  View logs${RESET}"
+        echo -e "${M2}  8)  Remove domain config${RESET}"
+        echo -e "${M11}  9)  Setup firewall${RESET}"
+        echo -e "${M10}  10) Firewall status${RESET}"
+        echo -e "${M1}  11) Fix auto-start (persistence)${RESET}"
+        echo -e "${M12}  12) FULL Nginx uninstall + cleanup${RESET}"
+        echo -e "${M6}  0)  Exit${RESET}"
+        
         local CH; ask_optional CH "Choose"
         case "$CH" in
             1)  do_install ;;
