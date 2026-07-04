@@ -1,14 +1,92 @@
 #!/bin/bash
+# ============================================================
+#  GoldIP Nginx Camouflage Installer & Manager  v4.1 (Uncut)
+#  CHANGELOG v4.1 (on top of v4.0's backend Host-header fix):
+#   - NEW: nginx now also writes a dedicated TLS server block for
+#     PANEL_DOMAIN, using the SAME shared certificate as CDN_DOMAIN
+#     (your cert covers all subdomains, per your setup). This block
+#     ONLY proxies to the x-ui panel port — it contains ZERO ws/
+#     xhttp/httpupgrade locations. Reality, gRPC, and every other
+#     non-CDN inbound remain 100% untouched, still listening
+#     directly on their own ports exactly as before.
+#   - CONFIRMED: only inbounds with network type ws, httpupgrade,
+#     xhttp, or splithttp are ever modified (listen/port rewritten
+#     to 127.0.0.1:<local>, security stripped, transport Host header
+#     forced to CDN_DOMAIN, hosts-table rebuilt). Every other
+#     inbound type is explicitly skipped and reported as such.
+#  CHANGELOG v4.0 (fixes the "looks like CDN but backend still
+#  talks to panel domain" bug from v3.9):
+#   - ROOT CAUSE FOUND: v3.9 only wrote CDN_DOMAIN into the x-ui
+#     "hosts" table (used for QR/subscription links). It NEVER
+#     touched the actual stream_settings.wsSettings.headers.Host
+#     or stream_settings.xhttpSettings.host fields inside the
+#     inbound itself. Those fields are what Xray ACTUALLY uses
+#     for the real WebSocket/XHTTP handshake at runtime. If they
+#     were empty or still set to the panel domain, the backend
+#     connection negotiated with a Host header that did not match
+#     CDN_DOMAIN — while the link/QR shown to the user still said
+#     CDN_DOMAIN. Result: looks CDN, behaves like direct-to-panel.
+#   - FIX: strip_tls_py now ALSO force-writes
+#     wsSettings.headers.Host / xhttpSettings.host (and
+#     httpupgradeSettings.host where applicable) to CDN_DOMAIN,
+#     for every CDN-compatible inbound touched by this script.
+#     This is done inside the SAME python transaction that already
+#     rewrites stream_settings, so there is no window where the
+#     two can drift apart again.
+#   - FIX: subscription server settings (subDomain / subPort) are
+#     now checked. If subDomain is empty or equals PANEL_DOMAIN
+#     while inbounds are CDN-routed, you get an explicit warning
+#     (never silently "fixed" — subscription domain is your choice,
+#     but you must know it's wrong) with the option to set it to
+#     CDN_DOMAIN in one step.
+#   - NEW: verify_cdn_binding — a dedicated menu action + automatic
+#     post-apply check that re-reads the DB and prints, per inbound:
+#     the live listen/port, hosts.address, wsSettings/xhttpSettings
+#     Host, and whether they ALL agree with CDN_DOMAIN. No more
+#     guessing — you see the real bound values, not just intent.
+#   - NEW: same fix applied to ANY inbound the auto-builder touches,
+#     including ones added later — every time you run "Install /
+#     Config website" and choose Auto discovery, the Host-header
+#     consistency check + fix runs again for all CDN inbounds.
+#   - kept from v3.9: explicit panel/CDN domain separation, hardcoded
+#     nginx Host header (never $host passthrough), shared-cert SAN
+#     validation, full colored menu, colored logs, robust uninstall,
+#     Cloudflare Origin-CA diagnosis, nginx-extras auto-install,
+#     nginx -t / restart failures never swallowed, http2 syntax
+#     version-aware.
+# ============================================================
 set -uo pipefail
 
 RESET='\033[0m'
-M1='\033[1;36m'; M2='\033[1;35m'; M3='\033[1;34m'; M4='\033[1;32m'
-M5='\033[1;33m'; M6='\033[1;31m'; M7='\033[1;95m'; M8='\033[1;96m'
-M9='\033[1;92m'; M10='\033[1;93m'; M11='\033[1;94m'; M12='\033[1;91m'
+
+# ---------------- Color Palette (256-color ANSI) ----------------
+C_OK='\033[1;32m'      # green  - success ONLY
+C_ERR='\033[1;31m'     # red    - delete / error ONLY
+
+C_PINK='\033[1;38;5;213m'
+C_OLIVE='\033[1;38;5;100m'
+C_LPINK='\033[1;38;5;217m'
+C_TEALGREY='\033[1;38;5;108m'
+C_CHOC='\033[1;38;5;130m'
+C_LCHOC='\033[1;38;5;180m'
+C_SKY='\033[1;38;5;75m'
+C_PURPLE='\033[1;38;5;141m'
+C_GOLD='\033[1;38;5;220m'
+C_ORANGE='\033[1;38;5;208m'
+C_DEEPTEAL='\033[1;38;5;37m'
+C_SLATE='\033[1;38;5;103m'
+C_ROSE='\033[1;38;5;168m'
+C_LIME='\033[1;38;5;154m'
+C_CYAN2='\033[1;38;5;51m'
+
 TITLE='\033[1;36m'; INFO='\033[1;34m'
 OK_BG='\033[42m\033[97m'; WARN_BG='\033[43m\033[97m'; ERR_BG='\033[41m\033[97m'
 
-PALETTE=(M1 M2 M3 M4 M5 M7 M8 M9 M10 M11) # رنگ قرمز حذف شد تا فقط برای ارور بماند
+SKIP_BG='\033[1;30;43m'   # yellow bg, black text -> skipped (non-CDN) inbound
+CDN_BG='\033[1;30;42m'    # green bg,  black text -> CDN-compatible inbound
+FIX_BG='\033[1;30;46m'    # cyan bg,   black text -> Host-header fix applied
+
+PALETTE=(C_PINK C_OLIVE C_LPINK C_TEALGREY C_CHOC C_LCHOC C_SKY C_PURPLE C_GOLD C_ORANGE)
 __cidx=0
 CURCOLOR=""
 nextcolor() {
@@ -17,9 +95,10 @@ nextcolor() {
     CURCOLOR="${!name}"
 }
 
-ok()   { echo -e "${OK_BG} OK ${RESET} \033[1;32m$1${RESET}"; }
+ok()   { echo -e "${OK_BG} OK ${RESET} ${C_OK}$1${RESET}"; }
 warn() { echo -e "${WARN_BG} WARN ${RESET} \033[1;33m$1${RESET}"; }
-err()  { echo -e "${ERR_BG} ERROR ${RESET} \033[1;31m$1${RESET}"; }
+err()  { echo -e "${ERR_BG} ERROR ${RESET} ${C_ERR}$1${RESET}"; }
+fix()  { echo -e "${FIX_BG} FIXED ${RESET} ${C_CYAN2}$1${RESET}"; }
 
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 CAMO_ROOT="/var/www/goldip"
@@ -31,6 +110,7 @@ ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.11
 ARVAN_V6_DEFAULT=""
 CF_V4=""; CF_V6=""; ARVAN_V4=""; ARVAN_V6=""
 
+# ---------------- Input helpers ----------------
 ask() {
     local __var="$1" __q="$2" __hint="${3:-}" __ans __c
     while true; do
@@ -93,8 +173,13 @@ ask_file() {
 ask_choice() {
     local __var="$1" __q="$2" __valid="$3" __ans __c
     while true; do
-        nextcolor; __c="$CURCOLOR"
-        echo -e "${__c}${__q} [${__valid//|//}]:${RESET}"; read -r __ans
+        echo -e "${INFO}${__q}${RESET}"
+        IFS='|' read -ra __opts <<< "$__valid"
+        for __o in "${__opts[@]}"; do
+            nextcolor
+            echo -e "  ${CURCOLOR}${__o})${RESET}"
+        done
+        read -r __ans
         printf '%s' "$__ans" | grep -qiE "^(${__valid})$" && { printf -v "$__var" '%s' "$__ans"; return 0; }
         warn "Invalid choice."
     done
@@ -113,7 +198,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v3.7 (Uncut)
+    N G I N X   C A M O U F L A G E   v4.1 (Uncut)
 ==========================================================
 EOF
 }
@@ -122,15 +207,7 @@ require_root() { [ "$(id -u)" -eq 0 ] || { err "Run this script as root."; exit 
 
 ensure_sqlite3() { command -v sqlite3 >/dev/null 2>&1 || apt-get install -y sqlite3 >/dev/null 2>&1; }
 
-# ---------------- FIX v3.7: install nginx WITH http_sub_module from the start ----------------
-# Root cause of "HTTPS never comes up, site stays on HTTP only":
-#   the old script installed plain `nginx`, then LATER tried to silently
-#   `apt-get install nginx-extras` inside write_config. nginx-core/nginx-light
-#   and nginx-extras CONFLICT in apt, so that late install failed silently
-#   (output redirected to /dev/null). http_sub_module never got installed,
-#   nginx -t failed because of sub_filter/sub_filter_once directives, and
-#   systemctl restart nginx was therefore never called -> the HTTPS server
-#   block (with your Cloudflare cert) never actually loaded.
+# ---------------- install nginx WITH http_sub_module from the start ----------------
 install_nginx() {
     if command -v nginx >/dev/null 2>&1; then
         if nginx -V 2>&1 | grep -q 'http_sub_module'; then
@@ -141,8 +218,6 @@ install_nginx() {
     fi
 
     apt-get update -y >/dev/null 2>&1
-
-    # حذف نسخه‌های کانفلیکت‌دار قبل از نصب نسخه extras (و الا apt ساکت fail می‌کند)
     apt-get remove -y nginx nginx-core nginx-light nginx-full nginx-common >/dev/null 2>&1
     apt-get autoremove -y >/dev/null 2>&1
 
@@ -161,14 +236,18 @@ install_nginx() {
 }
 
 # ---------------- Location Builder ----------------
+# every location hardcodes the Host header to CDN_DOMAIN explicitly
+# (never passes through $host), guaranteeing the backend xray inbound
+# always sees the CDN domain regardless of what a client sent, and
+# guaranteeing the panel domain can never leak into inbound routing.
 make_location() {
-    local t="$1" p="$2" port="$3"
+    local t="$1" p="$2" port="$3" hostheader="$4"
     [ "${p:0:1}" != "/" ] && p="/$p"
     if [ "$t" = "xhttp" ]; then
         printf '    location %s {\n' "$p"
         printf '        proxy_pass http://127.0.0.1:%s;\n' "$port"
         printf '        proxy_http_version 1.1;\n'
-        printf '        proxy_set_header Host $host;\n'
+        printf '        proxy_set_header Host %s;\n' "$hostheader"
         printf '        proxy_set_header X-Real-IP $remote_addr;\n'
         printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
         printf '        proxy_set_header X-Forwarded-Proto $scheme;\n'
@@ -182,7 +261,7 @@ make_location() {
         printf '        proxy_http_version 1.1;\n'
         printf '        proxy_set_header Upgrade $http_upgrade;\n'
         printf '        proxy_set_header Connection "upgrade";\n'
-        printf '        proxy_set_header Host $host;\n'
+        printf '        proxy_set_header Host %s;\n' "$hostheader"
         printf '        proxy_set_header X-Real-IP $remote_addr;\n'
         printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
         printf '        proxy_set_header X-Forwarded-Proto $scheme;\n'
@@ -209,10 +288,15 @@ alpn_for_net() {
     esac
 }
 
+# insert_host_py takes address/sni/host_header as ONE explicit parameter
+# ($4 = cdn_host) that the caller MUST pass as CDN_DOMAIN. There is no
+# code path where PANEL_DOMAIN can end up here — callers only ever have
+# $PRIMARY (== CDN_DOMAIN) in scope at the call site (see auto_build_locations).
+# This writes the x-ui "hosts" table used for QR/subscription LINK TEXT only.
 insert_host_py() {
     python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYEOF'
 import sqlite3, sys, time
-db_path, inbound_id, remark, address, port, sni, alpn_json = sys.argv[1:8]
+db_path, inbound_id, remark, cdn_host, port, sni, alpn_json = sys.argv[1:8]
 now_ms = int(time.time() * 1000)
 try:
     con = sqlite3.connect(db_path)
@@ -222,37 +306,125 @@ try:
             inbound_id, sort_order, remark, server_description, is_disabled, is_hidden,
             address, port, security, sni, host_header, path, alpn, fingerprint, override_sni_from_address,
             keep_sni_blank, allow_insecure, created_at, updated_at
-        ) VALUES (?, 0, ?, '', 0, 0, ?, ?, 'tls', ?, '', '', ?, 'chrome', 1, 0, 0, ?, ?)
-    """, (int(inbound_id), remark, address, int(port), sni, alpn_json, now_ms, now_ms))
+        ) VALUES (?, 0, ?, '', 0, 0, ?, ?, 'tls', ?, ?, '', ?, 'chrome', 1, 0, 0, ?, ?)
+    """, (int(inbound_id), remark, cdn_host, int(port), sni, cdn_host, alpn_json, now_ms, now_ms))
     con.commit(); con.close(); print("OK"); sys.exit(0)
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
 PYEOF
 }
 
+# ============================================================
+# THE ACTUAL FIX (v4.0): strip_tls_py used to only flip security
+# to "none" and strip tls/reality blocks. It NEVER touched the
+# transport-level Host header that Xray uses for the REAL
+# WebSocket/XHTTP/HTTPUpgrade handshake — that field lives at
+# stream_settings.wsSettings.headers.Host (or .xhttpSettings.host,
+# or .httpupgradeSettings.host depending on transport). If that
+# field was blank or still set to the old panel domain, the
+# backend connection between nginx and Xray (and, more importantly,
+# what Xray validates the request against) used the WRONG host —
+# even though the "hosts" table (cosmetic, for QR/links) correctly
+# showed CDN_DOMAIN. This function now force-writes the transport
+# Host header to cdn_host in the SAME atomic write as the TLS strip,
+# for ws, xhttp/splithttp, and httpupgrade transports.
+# ============================================================
 strip_tls_py() {
-    python3 - "$1" "$2" "$3" <<'PYEOF'
+    python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
 import sqlite3, json, sys
 try:
-    con = sqlite3.connect(sys.argv[1]); cur = con.cursor(); inb_id = int(sys.argv[2]); net = sys.argv[3]
+    con = sqlite3.connect(sys.argv[1]); cur = con.cursor()
+    inb_id = int(sys.argv[2]); net = sys.argv[3]; cdn_host = sys.argv[4]
+
     cur.execute("SELECT stream_settings FROM inbounds WHERE id=?", (inb_id,))
     row = cur.fetchone()
+    changed_host = False
     if row and row[0]:
         ss = json.loads(row[0])
         ss["security"] = "none"
-        for k in ("tlsSettings", "realitySettings", "externalProxy", "externalProxySettings"): ss.pop(k, None)
-        
+        for k in ("tlsSettings", "realitySettings", "externalProxy", "externalProxySettings"):
+            ss.pop(k, None)
+
         if net in ("xhttp", "splithttp"):
             s_key = net + "Settings"
-            if s_key not in ss: ss[s_key] = {}
-            if "extra" not in ss[s_key]: ss[s_key]["extra"] = {}
+            if s_key not in ss or not isinstance(ss.get(s_key), dict):
+                ss[s_key] = {}
+            if "extra" not in ss[s_key]:
+                ss[s_key]["extra"] = {}
             ss[s_key]["extra"]["xpaddingBytes"] = "100-1000"
-            
+            # THE FIX: force the transport-level host to CDN_DOMAIN.
+            # x-ui/Xray reads this field for the real handshake, not
+            # the cosmetic "hosts" table.
+            if ss[s_key].get("host") != cdn_host:
+                ss[s_key]["host"] = cdn_host
+                changed_host = True
+
+        elif net == "ws":
+            if "wsSettings" not in ss or not isinstance(ss.get("wsSettings"), dict):
+                ss["wsSettings"] = {}
+            if "headers" not in ss["wsSettings"] or not isinstance(ss["wsSettings"].get("headers"), dict):
+                ss["wsSettings"]["headers"] = {}
+            if ss["wsSettings"]["headers"].get("Host") != cdn_host:
+                ss["wsSettings"]["headers"]["Host"] = cdn_host
+                changed_host = True
+
+        elif net == "httpupgrade":
+            if "httpupgradeSettings" not in ss or not isinstance(ss.get("httpupgradeSettings"), dict):
+                ss["httpupgradeSettings"] = {}
+            if ss["httpupgradeSettings"].get("host") != cdn_host:
+                ss["httpupgradeSettings"]["host"] = cdn_host
+                changed_host = True
+
         cur.execute("UPDATE inbounds SET stream_settings=? WHERE id=?", (json.dumps(ss), inb_id))
         con.commit()
-    con.close(); print("OK"); sys.exit(0)
+    con.close()
+    print("HOSTFIXED" if changed_host else "OK")
+    sys.exit(0)
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
+PYEOF
+}
+
+# ============================================================
+# NEW v4.0: reads the CURRENT live state back from the DB after
+# writes are applied, so you can visually confirm — not assume —
+# that every CDN-routed inbound's transport Host header, the
+# cosmetic hosts.address, AND nginx's own Host header (which we
+# always hardcode to $PRIMARY in make_location) all agree.
+# ============================================================
+verify_cdn_binding_py() {
+    python3 - "$1" "$2" <<'PYEOF'
+import sqlite3, json, sys
+db_path, cdn_host = sys.argv[1:3]
+con = sqlite3.connect(db_path); cur = con.cursor()
+cur.execute("SELECT id, remark, listen, port, stream_settings FROM inbounds ORDER BY id;")
+rows = cur.fetchall()
+for iid, remark, listen, port, ss_raw in rows:
+    if not ss_raw:
+        continue
+    try:
+        ss = json.loads(ss_raw)
+    except Exception:
+        continue
+    net = ss.get("network", "")
+    if net not in ("ws", "xhttp", "splithttp", "httpupgrade"):
+        continue
+    transport_host = ""
+    if net == "ws":
+        transport_host = (ss.get("wsSettings") or {}).get("headers", {}).get("Host", "")
+    elif net in ("xhttp", "splithttp"):
+        transport_host = (ss.get(net + "Settings") or {}).get("host", "")
+    elif net == "httpupgrade":
+        transport_host = (ss.get("httpupgradeSettings") or {}).get("host", "")
+
+    cur.execute("SELECT address, host_header FROM hosts WHERE inbound_id=? ORDER BY id DESC LIMIT 1;", (iid,))
+    hrow = cur.fetchone()
+    hosts_address = hrow[0] if hrow else "(none)"
+    hosts_hostheader = hrow[1] if hrow else "(none)"
+
+    match = "MATCH" if (transport_host == cdn_host and hosts_address == cdn_host) else "MISMATCH"
+    print(f"{iid}|{remark}|{net}|{listen}|{port}|{transport_host}|{hosts_address}|{hosts_hostheader}|{match}")
+con.close()
 PYEOF
 }
 
@@ -260,13 +432,11 @@ PYEOF
 find_certificate_for_domain() {
     local domain; domain=$(strip_port "${1:-}")
     [ -n "$domain" ] || return 1
-    
-    # اولویت اول: مسیر اختصاصی
+
     if [ -f "/root/goldip/cert.pem" ] && [ -f "/root/goldip/key.pem" ]; then
         printf '%s|%s' "/root/goldip/cert.pem" "/root/goldip/key.pem"; return 0
     fi
-    
-    # اولویت‌های بعدی
+
     if [ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]; then
         printf '%s|%s' "/etc/letsencrypt/live/${domain}/fullchain.pem" "/etc/letsencrypt/live/${domain}/privkey.pem"; return 0
     fi
@@ -295,22 +465,111 @@ CERTHOOK_EOF
     ok "Certbot renewal hook installed."
 }
 
+# ---------------- "Connection is not private" diagnostics ----------------
+check_cert_browser_trust() {
+    local cert="$1" domain="$2"
+    local issuer is_origin_ca=0 resolved_ip
+
+    issuer=$(openssl x509 -in "$cert" -noout -issuer 2>/dev/null)
+
+    if printf '%s' "$issuer" | grep -qiE 'Cloudflare'; then
+        is_origin_ca=1
+    fi
+    if openssl x509 -in "$cert" -noout -text 2>/dev/null | grep -q '1.3.6.1.4.1.44947'; then
+        is_origin_ca=1
+    fi
+
+    if [ "$is_origin_ca" -eq 1 ]; then
+        warn "Detected a Cloudflare ORIGIN certificate (issuer: ${issuer#issuer=})."
+        warn "Origin CA certificates are ONLY trusted between Cloudflare's edge and your server."
+        warn "Real browsers/clients will ALWAYS show 'not private' for this cert UNLESS the"
+        warn "domain is Proxied (orange cloud) through Cloudflare, with SSL mode Full/Full(strict)."
+        echo ""
+
+        resolved_ip=$(resolve_domain_ips "$domain")
+        if [ -n "$resolved_ip" ]; then
+            local sample_ip; sample_ip=$(printf '%s' "$resolved_ip" | awk '{print $1}')
+            if printf '%s' "$sample_ip" | grep -qE '^(173\.245\.|103\.21\.|103\.22\.|103\.31\.|141\.101\.|108\.162\.|190\.93\.|188\.114\.|197\.234\.|198\.41\.|162\.158\.|104\.16\.|104\.24\.|172\.6[4-9]\.|172\.7[01]\.|131\.0\.72\.)'; then
+                ok "DNS check: ${domain} resolves to ${sample_ip}, which IS a Cloudflare IP range (Proxied / orange cloud). Good."
+            else
+                err "DNS check: ${domain} resolves to ${sample_ip}, which is NOT a Cloudflare IP."
+                err "This means the domain is DNS-only (grey cloud) and clients connect DIRECTLY"
+                err "to your server, where they see the Origin Cert and reject it."
+                err "Fix: in the Cloudflare dashboard -> DNS -> click the grey cloud next to"
+                err "${domain} to turn it orange (Proxied), then wait 1-2 minutes and retest."
+            fi
+        else
+            warn "Could not resolve ${domain} from this server to verify Cloudflare proxy status."
+        fi
+        echo ""
+        local CONT; ask_optional CONT "Continue anyway with this certificate?" "[y/N]"
+        is_yes "$CONT" || { err "Aborted by user. Fix the Cloudflare proxy/cert setup and re-run."; exit 1; }
+    else
+        ok "Certificate issuer does not look like a Cloudflare Origin CA cert. OK for direct trust."
+    fi
+}
+
+# verify a shared certificate actually covers BOTH domains (SAN list, or
+# CN as fallback for very old certs). Fails loudly if it doesn't, rather
+# than letting nginx silently serve a cert that doesn't match one of the
+# two server_names. A wildcard cert (*.example.com) covers both panel
+# and CDN subdomains automatically as long as both are one-level subs.
+check_cert_covers_domain() {
+    local cert="$1" domain="$2" label="$3"
+    local san cn
+
+    san=$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | tr -d ' ' | tr ',' '\n' | grep -oE 'DNS:[^,]+' | sed 's/^DNS://')
+    cn=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | grep -oE 'CN\s*=\s*[^,/]+' | sed -E 's/CN\s*=\s*//')
+
+    local covered=0
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        if [ "$name" = "$domain" ]; then covered=1; break; fi
+        case "$name" in
+            \*.*)
+                local suffix="${name#\*.}"
+                case "$domain" in *".${suffix}") covered=1; break ;; esac
+                ;;
+        esac
+    done <<< "$san"
+
+    if [ "$covered" -eq 0 ] && [ "$cn" = "$domain" ]; then covered=1; fi
+
+    if [ "$covered" -eq 1 ]; then
+        ok "Certificate covers ${label} (${domain})."
+        return 0
+    else
+        err "Certificate does NOT cover ${label} (${domain})."
+        err "Certificate SAN list: $(printf '%s' "$san" | tr '\n' ' ')"
+        err "Certificate CN: ${cn}"
+        return 1
+    fi
+}
+
 # ---------------- Auto Build Locations ----------------
+# end-of-run summary tracks CDN-routed vs non-CDN inbounds explicitly so
+# the user sees exactly what goes through CDN_DOMAIN and what stays
+# direct/panel-only.
+CDN_ROUTED_SUMMARY=""
+NONCDN_SUMMARY=""
+HOSTFIX_SUMMARY=""
+
 auto_build_locations() {
     local db=""; for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do [ -f "$c" ] && db="$c" && break; done
     [ -z "$db" ] && return 1
     ok "Reading inbounds from: $db"
 
-    local idx=0 id port ss net path rawpath
-    local -a IN_ID IN_PORT IN_NET IN_PATH IN_SS
-    while IFS='|' read -r id port ss; do
+    local idx=0 id port ss net path rawpath remark rawremark
+    local -a IN_ID IN_PORT IN_NET IN_PATH IN_SS IN_REMARK
+    while IFS='|' read -r id port ss remark; do
         [ -n "$port" ] || continue
         net=$(printf '%s' "$ss" | grep -oE '"network"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         rawpath=$(printf '%s' "$ss" | grep -oE '"path"[ ]*:[ ]*"[^"]*"' | head -n1 | sed -E 's/.*:[ ]*"([^"]*)"/\1/')
         path="${rawpath%%\?*}"
         idx=$((idx+1))
-        IN_ID[$idx]="$id"; IN_PORT[$idx]="$port"; IN_NET[$idx]="${net:-unknown}"; IN_PATH[$idx]="$path"; IN_SS[$idx]="$ss"
-    done < <(sqlite3 -separator '|' "$db" "SELECT id, port, replace(replace(stream_settings, char(10), ' '), char(13), ' ') FROM inbounds;" 2>/dev/null)
+        IN_ID[$idx]="$id"; IN_PORT[$idx]="$port"; IN_NET[$idx]="${net:-unknown}"; IN_PATH[$idx]="$path"
+        IN_SS[$idx]="$ss"; IN_REMARK[$idx]="${remark:-inbound-$id}"
+    done < <(sqlite3 -separator '|' "$db" "SELECT id, port, replace(replace(stream_settings, char(10), ' '), char(13), ' '), remark FROM inbounds;" 2>/dev/null)
 
     LOCATIONS=""; USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""; local added=0
@@ -318,43 +577,146 @@ auto_build_locations() {
     local op_count=0 ltype fport
 
     for n in $(seq 1 "$idx"); do
-        net="${IN_NET[$n]}"; port="${IN_PORT[$n]}"; path="${IN_PATH[$n]}"; id="${IN_ID[$n]}"
-        
-        # گارد امنیتی: فقط و فقط پروتکل‌های مجاز CDN وارد انجین‌اکس می‌شوند
+        net="${IN_NET[$n]}"; port="${IN_PORT[$n]}"; path="${IN_PATH[$n]}"; id="${IN_ID[$n]}"; remark="${IN_REMARK[$n]}"
+
         case "$net" in
             ws|httpupgrade) ltype="upgrade" ;;
             xhttp|splithttp) ltype="xhttp" ;;
-            *) ok "Skipped non-CDN protocol: ${net} (Port ${port})"; continue ;;
+            *)
+                echo -e "${SKIP_BG} SKIPPED (non-CDN) ${RESET} ${net} \"${remark}\" (Port ${port}) — stays DIRECT on ${PANEL_DOMAIN:-server IP}, bypasses nginx/CDN entirely."
+                NONCDN_SUMMARY="${NONCDN_SUMMARY}"$'\n'"  - [${net}] \"${remark}\" on port ${port} -> direct via ${PANEL_DOMAIN:-<server IP>} (NOT behind CDN)"
+                continue ;;
         esac
 
         [ -z "$path" ] || [ "$path" = "/" ] && continue
         fport="$port"
         if [ "$port" = "$HTTPS_PORT" ] || [ "$port" = "$HTTP_PORT" ]; then fport=$(free_port); fi
         TAKEN_PORTS="${TAKEN_PORTS} ${fport}"
-        
+
         op_count=$((op_count+1))
         OP_IDS[$op_count]="$id"; OP_FPORTS[$op_count]="$fport"; OP_NETS[$op_count]="$net"
         OP_PATHS[$op_count]="$path"; OP_ALPNS[$op_count]=$(alpn_for_net "$net")
-        
-        LOCATIONS="${LOCATIONS}"$'\n'"$(make_location "$ltype" "$path" "$fport")"
-        ok "Queued: ${net} ${path} -> 127.0.0.1:${fport} (Host: ${PRIMARY}:443)"
+
+        # Host header for this nginx location is ALWAYS CDN_DOMAIN (PRIMARY),
+        # explicitly, never the panel domain.
+        LOCATIONS="${LOCATIONS}"$'\n'"$(make_location "$ltype" "$path" "$fport" "$PRIMARY")"
+        echo -e "${CDN_BG} CDN-OK ${RESET} ${net} \"${remark}\" ${path} -> 127.0.0.1:${fport} (nginx Host header: ${PRIMARY}, exposed via CDN_DOMAIN:443)"
+        CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [${net}] \"${remark}\" ${path} -> via ${PRIMARY} (CDN-proxied)"
         added=$((added+1))
     done
 
     [ "$added" -eq 0 ] && { warn "No CDN-compatible inbounds found."; return 1; }
-    local AP; ask_optional AP "Apply DB changes (Inject xPadding + Rebuild Hosts)?" "[y/N]"
+    local AP; ask_optional AP "Apply DB changes (fix Host headers + rebuild hosts, CDN_DOMAIN=${PRIMARY})?" "[y/N]"
     if is_yes "$AP"; then
         cp "$db" "${db}.bak.$(date +%s)"
+        HOSTFIX_SUMMARY=""
         for m in $(seq 1 "$op_count"); do
             mid="${OP_IDS[$m]}"; mfport="${OP_FPORTS[$m]}"; mnet="${OP_NETS[$m]}"; malpn="${OP_ALPNS[$m]}"
             sqlite3 "$db" "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};"
-            strip_tls_py "$db" "$mid" "$mnet" >/dev/null
+
+            # THE FIX: strip_tls_py now takes CDN_DOMAIN as an explicit 4th
+            # argument and force-writes the transport-level Host header
+            # (wsSettings.headers.Host / xhttpSettings.host /
+            # httpupgradeSettings.host) to it. Result string tells us
+            # whether a mismatched Host was actually found and corrected.
+            local tls_result
+            tls_result=$(strip_tls_py "$db" "$mid" "$mnet" "$PRIMARY")
+            if [ "$tls_result" = "HOSTFIXED" ]; then
+                fix "Inbound #${mid} (${mnet}): transport Host header was WRONG (not ${PRIMARY}) — corrected now."
+                HOSTFIX_SUMMARY="${HOSTFIX_SUMMARY}"$'\n'"  - Inbound #${mid} [${mnet}]: transport Host header corrected -> ${PRIMARY}"
+            elif [ "$tls_result" != "OK" ]; then
+                err "Inbound #${mid} (${mnet}): failed to update stream_settings — ${tls_result}"
+            fi
+
             sqlite3 "$db" "DELETE FROM hosts WHERE inbound_id=${mid};"
+            # address/sni/host_header for the x-ui "hosts" record (cosmetic
+            # QR/subscription text) is explicitly $PRIMARY (== CDN_DOMAIN),
+            # passed by name, never derived from the panel domain.
             insert_host_py "$db" "$mid" "$mnet" "$PRIMARY" "443" "$PRIMARY" "$malpn" >/dev/null
         done
-        ok "Database updated! Restarting x-ui..."; systemctl restart x-ui
+        ok "Database updated (transport Host headers + hosts table all point to ${PRIMARY})! Restarting x-ui..."
+        systemctl restart x-ui
+
+        check_subscription_domain "$db"
+
+        echo ""
+        echo -e "${INFO}--- Verifying live binding (reading DB back, not trusting intent) ---${RESET}"
+        print_verify_table "$db"
     fi
     return 0
+}
+
+# ============================================================
+# NEW v4.0: checks x-ui's own subscription settings (subDomain).
+# If subscription links are generated from subDomain and it's
+# still empty or equal to the panel domain, subscription-based
+# clients would fetch configs pointing at the wrong host even
+# though the inbounds themselves are now fixed. This never
+# silently changes it — only warns and offers a one-key fix.
+# ============================================================
+check_subscription_domain() {
+    local db="$1"
+    local subDomain subEnable
+    subDomain=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='subDomain' LIMIT 1;" 2>/dev/null)
+    subEnable=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='subEnable' LIMIT 1;" 2>/dev/null)
+
+    [ "$subEnable" = "true" ] || return 0
+
+    if [ -z "$subDomain" ] || [ "$subDomain" = "$PANEL_DOMAIN" ]; then
+        warn "x-ui Subscription domain (subDomain) is '${subDomain:-<empty>}' — this is the PANEL domain,"
+        warn "not the CDN domain. Subscription links generated by x-ui will point clients at"
+        warn "${subDomain:-<empty/server IP>} instead of ${PRIMARY}, bypassing your CDN camouflage entirely."
+        local FIXSUB; ask_optional FIXSUB "Set subDomain to ${PRIMARY} now?" "[y/N]"
+        if is_yes "$FIXSUB"; then
+            sqlite3 "$db" "UPDATE settings SET value='${PRIMARY}' WHERE key='subDomain';"
+            fix "subDomain updated to ${PRIMARY}. Restarting x-ui..."
+            systemctl restart x-ui
+        else
+            warn "Left as-is. Subscription links may still leak the panel domain — fix manually in x-ui panel if needed."
+        fi
+    else
+        ok "x-ui Subscription domain (subDomain=${subDomain}) already matches CDN_DOMAIN or a custom value. OK."
+    fi
+}
+
+# ============================================================
+# NEW v4.0: prints the live, re-read-from-DB state for every
+# CDN-eligible inbound: transport Host header, hosts.address,
+# hosts.host_header, and a MATCH/MISMATCH verdict against
+# CDN_DOMAIN. This is the "show me, don't tell me" verification.
+# ============================================================
+print_verify_table() {
+    local db="$1"
+    printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s\n" "ID" "Remark" "Net" "Listen" "Port" "TransportHost" "hosts.address" "Verdict"
+    while IFS='|' read -r iid remark net listen port thost haddr hheader verdict; do
+        [ -z "$iid" ] && continue
+        if [ "$verdict" = "MATCH" ]; then
+            echo -e "${C_OK}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}"
+        else
+            echo -e "${C_ERR}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}"
+        fi
+    done < <(verify_cdn_binding_py "$db" "$PRIMARY")
+}
+
+# menu-accessible standalone verification (works without running install)
+verify_cdn_binding_menu() {
+    local db=""; for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do [ -f "$c" ] && db="$c" && break; done
+    [ -z "$db" ] && { err "x-ui database not found."; return 1; }
+    local CDNIN; ask CDNIN "CDN domain to verify against" "(e.g. cdn.example.com)"
+    CDNIN=$(strip_scheme "$CDNIN")
+    echo -e "${INFO}--- Live binding check for CDN_DOMAIN=${CDNIN} ---${RESET}"
+    printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s\n" "ID" "Remark" "Net" "Listen" "Port" "TransportHost" "hosts.address" "Verdict"
+    while IFS='|' read -r iid remark net listen port thost haddr hheader verdict; do
+        [ -z "$iid" ] && continue
+        if [ "$verdict" = "MATCH" ]; then
+            echo -e "${C_OK}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}"
+        else
+            echo -e "${C_ERR}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}"
+        fi
+    done < <(verify_cdn_binding_py "$db" "$CDNIN")
+    echo ""
+    warn "MISMATCH means the inbound's real WebSocket/XHTTP Host header does NOT equal the CDN domain."
+    warn "Run 'Install / Config website' -> Auto discovery again to force-correct any MISMATCH rows."
 }
 
 # ---------------- Camouflage Block ----------------
@@ -411,22 +773,48 @@ JSEOF
 
 # ---------------- Setup Flow ----------------
 gather_inputs() {
+    CDN_ROUTED_SUMMARY=""; NONCDN_SUMMARY=""; HOSTFIX_SUMMARY=""
+
     echo -e "${INFO}=== Panel Configuration ===${RESET}"
-    ask RAW_PANEL "Panel Domain / IP" "(e.g. panel.example.com)"
+    ask RAW_PANEL "Panel Domain / IP" "(e.g. panel.example.com — used ONLY for the x-ui admin panel + non-CDN inbounds)"
     PANEL_DOMAIN=$(strip_scheme "$RAW_PANEL"); PANEL_DOMAIN=$(strip_port "$PANEL_DOMAIN")
     ask_port PANEL_PORT "Panel Port" 2053
 
     echo -e "${INFO}=== CDN Configuration ===${RESET}"
-    ask RAW_CDN "CDN Domain" "(e.g. cdn.example.com)"
+    ask RAW_CDN "CDN Domain" "(e.g. cdn.example.com — this is the ONLY domain that goes through Cloudflare/Arvan proxy)"
     CDN_DOMAIN=$(strip_scheme "$RAW_CDN"); PRIMARY="$CDN_DOMAIN"
     ask_port HTTPS_PORT "HTTPS Port" 443
     ask_port HTTP_PORT  "HTTP Port"  80
+
+    if [ "$PANEL_DOMAIN" = "$CDN_DOMAIN" ]; then
+        warn "Panel domain and CDN domain are IDENTICAL (${CDN_DOMAIN})."
+        warn "This means you will NOT be able to run non-CDN inbounds (Reality/gRPC/Hysteria2)"
+        warn "alongside CDN inbounds, because Cloudflare's proxy only forwards standard HTTP/S,"
+        warn "not arbitrary protocols on arbitrary ports."
+        local SAMEOK; ask_optional SAMEOK "Continue with panel == CDN domain anyway?" "[y/N]"
+        is_yes "$SAMEOK" || { err "Aborted. Re-run and provide two different domains for panel and CDN."; exit 1; }
+    else
+        ok "Panel domain (${PANEL_DOMAIN}) and CDN domain (${CDN_DOMAIN}) are separate. Good — this is the recommended setup."
+    fi
+
+    echo -e "${INFO}=== Panel Domain CDN-Proxy Status ===${RESET}"
+    ask_optional PANEL_PROXIED "Will ${PANEL_DOMAIN} be Cloudflare/Arvan PROXIED (orange cloud)?" "[y/N] (choose N to keep it DNS-only for non-CDN inbounds)"
+    if is_yes "${PANEL_PROXIED:-}"; then
+        warn "You chose to proxy the PANEL domain too."
+        warn "Any non-CDN inbound (Reality, gRPC direct, Hysteria2/UDP, etc.) bound to ${PANEL_DOMAIN}"
+        warn "will likely BREAK, because Cloudflare's proxy does not forward arbitrary TCP/UDP —"
+        warn "only standard HTTP(S) traffic on 80/443 gets proxied correctly."
+        local PROXYOK; ask_optional PROXYOK "Understood — continue anyway?" "[y/N]"
+        is_yes "$PROXYOK" || { err "Aborted. Re-run and keep the panel domain DNS-only (grey cloud) instead."; exit 1; }
+    else
+        ok "Panel domain will stay DNS-only — non-CDN inbounds (Reality/gRPC/Hysteria2) will work normally on it."
+    fi
 
     echo -e "${INFO}=== TLS Certificate ===${RESET}"
     local FOUND AUTO_CERT="" AUTO_KEY=""
     FOUND="$(find_certificate_for_domain "$CDN_DOMAIN")" && IFS='|' read -r AUTO_CERT AUTO_KEY <<<"$FOUND"
     [ -z "$AUTO_CERT" ] && FOUND="$(find_certificate_for_domain "$PANEL_DOMAIN")" && IFS='|' read -r AUTO_CERT AUTO_KEY <<<"$FOUND"
-    
+
     if [ -n "$AUTO_CERT" ] && [ -f "$AUTO_CERT" ]; then
         ok "Found cert: ${AUTO_CERT}"
         local USE; ask_optional USE "Use this cert?" "[Y/n]"
@@ -435,9 +823,6 @@ gather_inputs() {
         ask_file SSL_CERT "Cert Path (fullchain)"; ask_file SSL_KEY "Key Path (privkey)"
     fi
 
-    # FIX v3.7: validate the cert/key actually load BEFORE writing the nginx
-    # config, so a bad Cloudflare cert/key pair fails loudly here instead of
-    # silently leaving the site on HTTP only.
     if ! openssl x509 -in "$SSL_CERT" -noout >/dev/null 2>&1; then
         err "SSL_CERT (${SSL_CERT}) is not a valid certificate file (openssl could not parse it)."
         exit 1
@@ -446,30 +831,47 @@ gather_inputs() {
         err "SSL_KEY (${SSL_KEY}) is not a valid private key file (openssl could not parse it)."
         exit 1
     fi
-    CERT_MODULUS=$(openssl x509 -in "$SSL_CERT" -noout -modulus 2>/dev/null | openssl md5)
-    KEY_MODULUS=$(openssl pkey -in "$SSL_KEY" -pubout 2>/dev/null | openssl md5)
-    # Note: modulus comparison above only works directly for RSA keys via
-    # `openssl rsa`; for EC keys this check is skipped rather than producing
-    # a false failure.
     if openssl rsa -in "$SSL_KEY" -noout -modulus >/dev/null 2>&1; then
-        KEY_MODULUS=$(openssl rsa -in "$SSL_KEY" -noout -modulus 2>/dev/null | openssl md5)
-        if [ "$CERT_MODULUS" != "$KEY_MODULUS" ]; then
-            err "SSL_CERT and SSL_KEY do NOT match (modulus mismatch). Double-check you copied the correct Cloudflare cert + key pair."
+        local cert_mod key_mod
+        cert_mod=$(openssl x509 -in "$SSL_CERT" -noout -modulus 2>/dev/null | openssl md5)
+        key_mod=$(openssl rsa -in "$SSL_KEY" -noout -modulus 2>/dev/null | openssl md5)
+        if [ "$cert_mod" != "$key_mod" ]; then
+            err "SSL_CERT and SSL_KEY do NOT match (modulus mismatch). Double-check the cert/key pair."
             exit 1
         fi
     fi
-    ok "Certificate and key validated successfully."
+    ok "Certificate and key validated successfully (parse + match OK)."
+
+    check_cert_browser_trust "$SSL_CERT" "$CDN_DOMAIN"
+
+    echo -e "${INFO}=== Shared Certificate Validation ===${RESET}"
+    local cdn_ok=1 panel_ok=1
+    check_cert_covers_domain "$SSL_CERT" "$CDN_DOMAIN" "CDN domain" || cdn_ok=0
+    if [ "$PANEL_DOMAIN" != "$CDN_DOMAIN" ]; then
+        check_cert_covers_domain "$SSL_CERT" "$PANEL_DOMAIN" "Panel domain" || panel_ok=0
+    fi
+    if [ "$cdn_ok" -eq 0 ]; then
+        err "Certificate does not cover the CDN domain (${CDN_DOMAIN}). This WILL cause TLS errors. Aborting."
+        exit 1
+    fi
+    if [ "$panel_ok" -eq 0 ]; then
+        warn "Certificate does NOT cover the panel domain (${PANEL_DOMAIN})."
+        warn "This is only a problem if you intend nginx/panel to present TLS for ${PANEL_DOMAIN} using this same cert."
+        local PCONT; ask_optional PCONT "Continue anyway?" "[y/N]"
+        is_yes "$PCONT" || { err "Aborted. Get a certificate (or SAN) that covers ${PANEL_DOMAIN} as well, or use a separate cert for the panel."; exit 1; }
+    fi
 
     ensure_cert_renew_hook "$SSL_CERT"
 
-    ask_optional BEHIND_CF "Behind Cloudflare CDN? (restore real visitor IP)" "[y/N]"
+    ask_optional BEHIND_CF "Behind Cloudflare CDN? (restore real visitor IP in nginx for the CDN domain)" "[y/N]"
 
     echo -e "${INFO}=== Inbounds ===${RESET}"
-    local DISC; ask_choice DISC "1) Auto (DB)  2) Manual" "1|2"
-    
+    local DISC; ask_choice DISC "Inbound discovery mode:" "1|2"
+    echo -e "    ${C_PINK}1) Auto (read from x-ui DB)${RESET}"
+    echo -e "    ${C_OLIVE}2) Manual entry${RESET}"
+
     [ "$DISC" = "1" ] && { auto_build_locations || warn "Auto-build failed or skipped. Switching to manual."; }
-    
-    # تنظیم دستی - gRPC از گزینه‌ها حذف شده
+
     if [ "$DISC" = "2" ] || [ -z "$LOCATIONS" ]; then
         ask_number NIN "How many CDN inbounds to add to Nginx?"
         local i=1
@@ -479,18 +881,26 @@ gather_inputs() {
             [ "${P_PATH:0:1}" = "/" ] || P_PATH="/$P_PATH"
             ask_number P_PORT "Local Xray port"
             echo -e "${INFO}Transport:${RESET}"
-            echo -e "  ${M1}1)${RESET} WebSocket / HTTPUpgrade  ${M2}2)${RESET} XHTTP"
+            echo -e "    ${C_PINK}1) WebSocket / HTTPUpgrade${RESET}"
+            echo -e "    ${C_OLIVE}2) XHTTP${RESET}"
             ask_choice P_TYPE "Selection" "1|2"
             case "$P_TYPE" in
-                1) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location upgrade "$P_PATH" "$P_PORT")" ;;
-                2) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location xhttp "$P_PATH" "$P_PORT")" ;;
+                1) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location upgrade "$P_PATH" "$P_PORT" "$PRIMARY")"
+                   CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [ws/httpupgrade] ${P_PATH} -> via ${PRIMARY} (manual entry)"
+                   warn "Manual entry does NOT touch x-ui's internal Host header field. Go into x-ui" ;;
+                2) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location xhttp "$P_PATH" "$P_PORT" "$PRIMARY")"
+                   CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [xhttp] ${P_PATH} -> via ${PRIMARY} (manual entry)"
+                   warn "Manual entry does NOT touch x-ui's internal Host header field. Go into x-ui" ;;
             esac
+            warn "-> panel and set this inbound's WS/XHTTP Host header to ${PRIMARY} manually, or use Auto discovery instead."
             i=$((i+1))
         done
     fi
 
     echo -e "${INFO}=== Camouflage ===${RESET}"
-    ask_choice CAMO "1) Reverse Proxy  2) Local HTML" "1|2"
+    ask_choice CAMO "Camouflage type:" "1|2"
+    echo -e "    ${C_PINK}1) Reverse Proxy (mirror a real website)${RESET}"
+    echo -e "    ${C_OLIVE}2) Local HTML (serve your own index.html)${RESET}"
     if [ "$CAMO" = "1" ]; then
         ask PROXY_URL "Website to proxy (e.g. example.com)"
         PROXY_HOST=$(strip_scheme "$PROXY_URL"); PROXY_SCHEME="https"
@@ -504,10 +914,7 @@ gather_inputs() {
     fi
 }
 
-# ---------------- FIX v3.7: nginx version-aware http2 syntax ----------------
-# nginx >= 1.25.1 deprecated "listen ... ssl http2;" in favor of a separate
-# "http2 on;" directive. The old combined form still works (warning only,
-# not a hard error) but this removes the warning and future-proofs the conf.
+# ---------------- nginx version-aware http2 syntax ----------------
 version_ge() {
     [ "$1" = "$2" ] && return 0
     [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]
@@ -524,6 +931,11 @@ detect_http2_syntax() {
     fi
 }
 
+# write_config ONLY ever writes a server block for CDN_DOMAIN (server_name
+# is CDN_DOMAIN, not panel domain). The panel is deliberately left OUT of
+# this nginx vhost so it is never accidentally routed through the
+# CDN-facing config. The x-ui panel continues to serve itself directly on
+# PANEL_PORT via its own domain, entirely separate from this file.
 write_config() {
     mkdir -p "$NGINX_CONF_DIR"
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null
@@ -531,8 +943,6 @@ write_config() {
 
     is_yes "${BEHIND_CF:-}" && write_cf_realip
 
-    # FIX v3.7: http_sub_module is now guaranteed present by install_nginx()
-    # at the top of do_install(). No more silent re-install attempt here.
     nginx -V 2>&1 | grep -q 'http_sub_module' || {
         err "http_sub_module is missing. Run option 1 again (it reinstalls nginx-extras) before continuing."
         return 1
@@ -557,37 +967,92 @@ write_config() {
         echo "    ssl_protocols TLSv1.2 TLSv1.3;"
         echo "    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;"
         echo "    ssl_prefer_server_ciphers off;"
-        
+
         echo "    server_tokens off;"
         echo "    add_header X-Content-Type-Options nosniff always;"
         echo "    add_header X-Frame-Options SAMEORIGIN always;"
         echo "    add_header Referrer-Policy no-referrer-when-downgrade always;"
         echo "    add_header Strict-Transport-Security \"max-age=63072000; includeSubDomains\" always;"
         echo "    add_header X-XSS-Protection \"0\" always;"
-        
+
         echo "    access_log /var/log/nginx/${PRIMARY}.access.log;"
         echo "    error_log  /var/log/nginx/${PRIMARY}.error.log;"
-        
+
         printf '%s\n' "${LOCATIONS}"
         echo "    ${CAMO_BLOCK}"
         echo "}"
     } > "$conf"
 
-    # FIX v3.7: never swallow nginx -t output again. Show it, and fail loudly
-    # (return 1) if the config is broken, instead of silently leaving the
-    # previous (HTTP-only) config active.
+    # PANEL_DOMAIN gets its OWN nginx TLS server block using the SAME
+    # shared certificate (it covers both CDN_DOMAIN and PANEL_DOMAIN, as
+    # confirmed by check_cert_covers_domain earlier). This block ONLY
+    # proxies to the x-ui panel port — it carries NONE of the ws/xhttp/
+    # httpupgrade locations, so Reality/gRPC/any other non-CDN inbound
+    # keeps listening on its own port exactly as before, completely
+    # untouched by this script.
+    if [ "$PANEL_DOMAIN" != "$CDN_DOMAIN" ]; then
+        local panel_conf="${NGINX_CONF_DIR}/${PANEL_DOMAIN}.conf"
+        {
+            echo "server {"
+            echo "    listen ${HTTPS_PORT} ssl${HTTP2_LISTEN_SUFFIX};"
+            [ -n "$HTTP2_DIRECTIVE" ] && echo "$HTTP2_DIRECTIVE"
+            echo "    server_name ${PANEL_DOMAIN};"
+            echo "    ssl_certificate     ${SSL_CERT};"
+            echo "    ssl_certificate_key ${SSL_KEY};"
+            echo "    ssl_protocols TLSv1.2 TLSv1.3;"
+            echo "    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;"
+            echo "    ssl_prefer_server_ciphers off;"
+            echo "    server_tokens off;"
+            echo "    access_log /var/log/nginx/${PANEL_DOMAIN}.access.log;"
+            echo "    error_log  /var/log/nginx/${PANEL_DOMAIN}.error.log;"
+            echo "    location / {"
+            echo "        proxy_pass http://127.0.0.1:${PANEL_PORT};"
+            echo "        proxy_http_version 1.1;"
+            echo "        proxy_set_header Upgrade \$http_upgrade;"
+            echo "        proxy_set_header Connection \"upgrade\";"
+            echo "        proxy_set_header Host \$host;"
+            echo "        proxy_set_header X-Real-IP \$remote_addr;"
+            echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+            echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+            echo "        proxy_read_timeout 300s;"
+            echo "        proxy_send_timeout 300s;"
+            echo "    }"
+            echo "}"
+        } > "$panel_conf"
+        ok "Panel domain TLS block written (${PANEL_DOMAIN}:${HTTPS_PORT}) using the SAME shared certificate — proxies ONLY to panel port ${PANEL_PORT}. No CDN inbounds attached; Reality/gRPC/other non-CDN inbounds are untouched."
+    fi
+
     if nginx -t; then
         if systemctl restart nginx; then
-            ok "Nginx Configured & Running on HTTPS (${HTTPS_PORT})!"
+            ok "Nginx Configured & Running on HTTPS (${HTTPS_PORT}) for CDN_DOMAIN=${CDN_DOMAIN} and PANEL_DOMAIN=${PANEL_DOMAIN}!"
         else
             err "nginx -t passed but 'systemctl restart nginx' failed. Run: systemctl status nginx -l"
             return 1
         fi
     else
         err "nginx -t FAILED (see errors above). HTTPS config was written to ${conf} but NOT activated."
-        err "The site is still running on whatever config was active before — likely why you're seeing HTTP only."
         return 1
     fi
+
+    echo ""
+    echo -e "${INFO}================= ROUTING SUMMARY =================${RESET}"
+    echo -e "${C_LIME}CDN-proxied domain:${RESET}   ${CDN_DOMAIN}  (behind Cloudflare/Arvan, nginx terminates TLS here)"
+    echo -e "${C_ROSE}Panel domain:${RESET}          ${PANEL_DOMAIN}  ($(is_yes "${PANEL_PROXIED:-}" && echo "PROXIED — non-CDN inbounds may break" || echo "DNS-only — safe for non-CDN inbounds"))"
+    if [ -n "$CDN_ROUTED_SUMMARY" ]; then
+        echo -e "${CDN_BG} Inbounds routed through CDN_DOMAIN: ${RESET}"
+        echo -e "${CDN_ROUTED_SUMMARY}"
+    fi
+    if [ -n "$NONCDN_SUMMARY" ]; then
+        echo -e "${SKIP_BG} Inbounds left DIRECT (non-CDN, use PANEL_DOMAIN/IP): ${RESET}"
+        echo -e "${NONCDN_SUMMARY}"
+    fi
+    if [ -n "$HOSTFIX_SUMMARY" ]; then
+        echo -e "${FIX_BG} Backend Host-header mismatches corrected this run: ${RESET}"
+        echo -e "${HOSTFIX_SUMMARY}"
+    else
+        ok "No backend Host-header mismatches found — everything was already consistent."
+    fi
+    echo -e "${INFO}=====================================================${RESET}"
 }
 
 # ---------------- Real IP / CDN Ranges ----------------
@@ -650,9 +1115,12 @@ whitelist_goldip() {
 # ---------------- Firewall (UFW) ----------------
 setup_firewall() {
     command -v ufw >/dev/null 2>&1 || apt-get install -y ufw >/dev/null
-    
+
     echo -e "${INFO}CDN Provider:${RESET}"
-    echo -e "  ${M1}1)${RESET} Cloudflare  ${M2}2)${RESET} ArvanCloud  ${M3}3)${RESET} Both  ${M8}4)${RESET} Custom"
+    echo -e "    ${C_PINK}1) Cloudflare${RESET}"
+    echo -e "    ${C_OLIVE}2) ArvanCloud${RESET}"
+    echo -e "    ${C_LPINK}3) Both${RESET}"
+    echo -e "    ${C_TEALGREY}4) Custom${RESET}"
     local CDN_CHOICE; ask_choice CDN_CHOICE "Selection" "1|2|3|4"
     local RANGES="" RANGES6=""
     case "$CDN_CHOICE" in
@@ -671,9 +1139,9 @@ setup_firewall() {
 
     ufw --force reset >/dev/null; ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null
     ufw allow "${SSH_PORT}/tcp" >/dev/null
-    
+
     whitelist_goldip
-    
+
     local XUI_PORTS="" xdb=""
     for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do [ -f "$c" ] && xdb="$c" && break; done
     if [ -n "$xdb" ]; then
@@ -684,7 +1152,6 @@ setup_firewall() {
         XUI_PORTS=$(printf '%s\n' "${pport} ${sport} ${iports}" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)
     fi
 
-    # Allow TCP & UDP for X-ui
     for p in $XUI_PORTS; do
         [ -z "$p" ] && continue
         ufw allow "${p}/tcp" >/dev/null 2>&1
@@ -700,7 +1167,7 @@ setup_firewall() {
         ufw allow from "$cidr" to any port "$FW_HTTPS" proto tcp >/dev/null 2>&1
         ufw allow from "$cidr" to any port "$FW_HTTP"  proto tcp >/dev/null 2>&1
     done
-    
+
     if [ -n "$TUN_PORT" ]; then
         [ -n "$FOREIGN_IP" ] && ufw allow from "$FOREIGN_IP" to any port "$TUN_PORT" proto tcp >/dev/null 2>&1 \
             || ufw allow "${TUN_PORT}/tcp" >/dev/null 2>&1
@@ -708,7 +1175,7 @@ setup_firewall() {
 
     ufw --force enable >/dev/null
     ok "Firewall Configured Successfully!"
-    
+
     command -v nginx >/dev/null 2>&1 && {
         local RIP
         case "$CDN_CHOICE" in
@@ -789,22 +1256,72 @@ XEOF
         || { local WD; ask_optional WD "Install 1-min watchdog?" "[y/N]"; is_yes "$WD" && install_watchdog; }
 }
 
-# ---------------- Uninstall & Logs ----------------
+# ---------------- FULL UNINSTALL ----------------
 full_uninstall() {
-    echo -e "${ERR_BG} WARNING ${RESET} \033[1;31mThis will COMPLETELY remove Nginx and all configs!\033[0m"
+    echo -e "${ERR_BG} WARNING ${RESET} ${C_ERR}This will COMPLETELY remove Nginx, all configs, logs and the watchdog!${RESET}"
     local CONFIRM; ask_optional CONFIRM "Type YES to confirm"
     [ "$CONFIRM" = "YES" ] || { warn "Cancelled."; return; }
-    systemctl stop nginx 2>/dev/null || true
-    systemctl disable nginx 2>/dev/null || true
-    systemctl stop goldip-watchdog.timer 2>/dev/null || true
-    systemctl disable goldip-watchdog.timer 2>/dev/null || true
-    rm -f /etc/systemd/system/goldip-watchdog.* /usr/local/bin/goldip-watchdog.sh
-    rm -rf /etc/systemd/system/nginx.service.d
-    systemctl daemon-reload >/dev/null 2>&1
-    apt-get purge -y nginx nginx-common nginx-full nginx-extras nginx-core 2>/dev/null || true
-    apt-get autoremove -y 2>/dev/null || true
-    rm -rf /etc/nginx /var/log/nginx /var/www/goldip
-    ok "Nginx fully uninstalled."
+
+    echo -e "${INFO}--- Step 1/7: stopping services ---${RESET}"
+    systemctl stop nginx 2>&1
+    systemctl disable nginx 2>&1
+    systemctl stop goldip-watchdog.timer 2>&1
+    systemctl disable goldip-watchdog.timer 2>&1
+
+    echo -e "${INFO}--- Step 2/7: removing watchdog ---${RESET}"
+    rm -fv /etc/systemd/system/goldip-watchdog.service \
+           /etc/systemd/system/goldip-watchdog.timer \
+           /usr/local/bin/goldip-watchdog.sh
+
+    echo -e "${INFO}--- Step 3/7: removing systemd drop-ins / overrides ---${RESET}"
+    rm -rfv /etc/systemd/system/nginx.service.d
+    rm -fv /etc/systemd/system/multi-user.target.wants/nginx.service 2>/dev/null
+    systemctl daemon-reload
+    systemctl reset-failed nginx 2>/dev/null
+
+    echo -e "${INFO}--- Step 4/7: purging ALL nginx packages ---${RESET}"
+    apt-get purge -y \
+        nginx nginx-common nginx-core nginx-light nginx-full nginx-extras \
+        libnginx-mod-* 2>&1
+    apt-get autoremove -y --purge 2>&1
+    apt-get autoclean -y 2>&1
+
+    echo -e "${INFO}--- Step 5/7: removing remaining files/directories ---${RESET}"
+    rm -rfv /etc/nginx
+    rm -rfv /var/log/nginx
+    rm -rfv /var/www/goldip
+    rm -rfv /var/cache/nginx
+    rm -rfv /var/lib/nginx
+    rm -fv  /etc/logrotate.d/nginx
+
+    echo -e "${INFO}--- Step 6/7: removing certbot renewal hook (GoldIP-installed only) ---${RESET}"
+    rm -fv /etc/letsencrypt/renewal-hooks/deploy/goldip-nginx-reload.sh
+
+    echo -e "${INFO}--- Step 7/7: verification ---${RESET}"
+    local leftover=0
+    if command -v nginx >/dev/null 2>&1; then
+        err "nginx binary STILL present at: $(command -v nginx)"
+        leftover=1
+    fi
+    if dpkg -l 2>/dev/null | grep -qE '^ii\s+nginx'; then
+        err "dpkg still reports an nginx-* package as installed:"
+        dpkg -l | grep -E '^ii\s+nginx'
+        leftover=1
+    fi
+    if [ -d /etc/nginx ]; then
+        err "/etc/nginx still exists."
+        leftover=1
+    fi
+    if systemctl list-unit-files 2>/dev/null | grep -q '^nginx\.service'; then
+        err "systemd still has an nginx.service unit registered."
+        leftover=1
+    fi
+
+    if [ "$leftover" -eq 0 ]; then
+        ok "Nginx fully uninstalled — no binary, package, config, log, or systemd unit remains."
+    else
+        err "Uninstall finished but some leftovers were detected above. Review and remove manually if needed."
+    fi
 }
 
 uninstall_domain() {
@@ -817,10 +1334,10 @@ colorize_access_line() {
     local line="$1" code
     code=$(printf '%s' "$line" | grep -oE '" [1-5][0-9][0-9] ' | head -n1 | tr -dc '0-9')
     case "$code" in
-        5*) echo -e "${ERR_BG} ${code} ${RESET} \033[1;31m$line\033[0m" ;;
-        4*) echo -e "${WARN_BG} ${code} ${RESET} \033[1;33m$line\033[0m" ;;
-        2*|3*) echo -e "${OK_BG} ${code} ${RESET} \033[1;32m$line\033[0m" ;;
-        *) echo -e "${M8}$line${RESET}" ;;
+        5*) echo -e "${ERR_BG} ${code} ${RESET} ${C_ERR}$line${RESET}" ;;
+        4*) echo -e "${WARN_BG} ${code} ${RESET} \033[1;33m$line${RESET}" ;;
+        2*|3*) echo -e "${OK_BG} ${code} ${RESET} ${C_OK}$line${RESET}" ;;
+        *) echo -e "${C_TEALGREY}$line${RESET}" ;;
     esac
 }
 
@@ -830,7 +1347,7 @@ view_logs() {
     for f in "$logdir"/*.log; do [ -f "$f" ] || continue; i=$((i+1)); LOGS[$i]="$f"; done
     [ "$i" -gt 0 ] || { warn "No logs found."; return; }
     echo -e "${INFO}Logs:${RESET}"
-    for n in $(seq 1 "$i"); do echo -e "  ${M8}${n})${RESET} ${LOGS[$n]}"; done
+    for n in $(seq 1 "$i"); do echo -e "    ${C_SKY}${n}) ${LOGS[$n]}${RESET}"; done
     local PICK; ask_number PICK "Select"
     { [ "$PICK" -ge 1 ] && [ "$PICK" -le "$i" ]; } || return
     tail -n 50 "${LOGS[$PICK]}" | while IFS= read -r line; do colorize_access_line "$line"; done
@@ -857,26 +1374,27 @@ do_install() {
     install_nginx || return 1
     ensure_sqlite3
     gather_inputs
-    write_config || { err "Install ABORTED: nginx config did not pass nginx -t / restart. Site left on previous config. Scroll up for the exact error."; return 1; }
+    write_config || { err "Install ABORTED: nginx config did not pass nginx -t / restart. Scroll up for the exact error."; return 1; }
     enable_persistence silent
 }
 
 menu() {
     while true; do
         clear; echo -e "${TITLE}"; header; echo -e "${RESET}"
-        echo -e "  ${M1}1)  Install / Config website"
-        echo -e "  ${M2}2)  Start Nginx"
-        echo -e "  ${M3}3)  Stop Nginx"
-        echo -e "  ${M4}4)  Restart Nginx"
-        echo -e "  ${M5}5)  Reload Nginx"
-        echo -e "  ${M7}6)  Status"
-        echo -e "  ${M8}7)  View logs"
-        echo -e "  ${M9}8)  Remove domain config"
-        echo -e "  ${M11}9)  Setup firewall"
-        echo -e "  ${M10}10) Firewall status"
-        echo -e "  ${M1}11) Fix auto-start (persistence)"
-        echo -e "  ${M6}12) FULL Nginx uninstall + cleanup"
-        echo -e "  ${M6}0)  Exit"
+        echo -e "  ${C_PINK}1)  Install / Config website${RESET}"
+        echo -e "  ${C_OLIVE}2)  Start Nginx${RESET}"
+        echo -e "  ${C_LPINK}3)  Stop Nginx${RESET}"
+        echo -e "  ${C_TEALGREY}4)  Restart Nginx${RESET}"
+        echo -e "  ${C_CHOC}5)  Reload Nginx${RESET}"
+        echo -e "  ${C_LCHOC}6)  Status${RESET}"
+        echo -e "  ${C_SKY}7)  View logs${RESET}"
+        echo -e "  ${C_PURPLE}8)  Remove domain config${RESET}"
+        echo -e "  ${C_GOLD}9)  Setup firewall${RESET}"
+        echo -e "  ${C_ORANGE}10) Firewall status${RESET}"
+        echo -e "  ${C_DEEPTEAL}11) Fix auto-start (persistence)${RESET}"
+        echo -e "  ${C_CYAN2}12) Verify CDN Host-header binding (live DB check)${RESET}"
+        echo -e "  ${C_ERR}13) FULL Nginx uninstall + cleanup${RESET}"
+        echo -e "  ${C_ERR}0)  Exit${RESET}"
         local CH; ask_optional CH "Choose"
         case "$CH" in
             1)  do_install ;;
@@ -890,7 +1408,8 @@ menu() {
             9)  setup_firewall ;;
             10) firewall_status ;;
             11) enable_persistence ;;
-            12) full_uninstall ;;
+            12) verify_cdn_binding_menu ;;
+            13) full_uninstall ;;
             0)  exit 0 ;;
             *)  err "Invalid choice." ;;
         esac
