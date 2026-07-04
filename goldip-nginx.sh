@@ -1,6 +1,14 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v4.2 (Uncut)
+#  GoldIP Nginx Camouflage Installer & Manager  v4.3 (Uncut)
+#  CHANGELOG v4.3:
+#   - REMOVED: the manual "Behind Cloudflare CDN?" question. You already
+#     provide the CDN domain and a Cloudflare-issued cert, so asking
+#     again was redundant. Now detected automatically via DNS: if
+#     CDN_DOMAIN resolves to a known Cloudflare IP range, real-IP
+#     restore is enabled with zero prompts. If not (Arvan, or orange
+#     cloud not yet on), it's skipped silently and can be turned on
+#     later from the firewall menu.
 #  CHANGELOG v4.2:
 #   - REMOVED: the redundant "will the panel domain be proxied?"
 #     question. It added an extra prompt for no protective benefit —
@@ -227,7 +235,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v4.2 (Uncut)
+    N G I N X   C A M O U F L A G E   v4.3 (Uncut)
 ==========================================================
 EOF
 }
@@ -908,7 +916,21 @@ gather_inputs() {
 
     ensure_cert_renew_hook "$SSL_CERT"
 
-    ask_optional BEHIND_CF "Behind Cloudflare CDN? (restore real visitor IP in nginx for the CDN domain)" "[y/N]"
+    # No manual "Behind Cloudflare CDN?" question. You already told us the
+    # CDN domain and got the cert from Cloudflare — asking again is
+    # redundant. Detect it automatically: resolve CDN_DOMAIN and check if
+    # the IP falls in a known Cloudflare range. If yes, real-IP restore is
+    # enabled automatically. If the domain doesn't resolve to a Cloudflare
+    # IP (e.g. Arvan, or proxy not yet turned on), we skip it silently —
+    # you can still turn it on later via the firewall menu.
+    BEHIND_CF=""
+    local __cdn_ip; __cdn_ip=$(resolve_domain_ips "$CDN_DOMAIN" | awk '{print $1}')
+    if [ -n "$__cdn_ip" ] && printf '%s' "$__cdn_ip" | grep -qE '^(173\.245\.|103\.21\.|103\.22\.|103\.31\.|141\.101\.|108\.162\.|190\.93\.|188\.114\.|197\.234\.|198\.41\.|162\.158\.|104\.16\.|104\.24\.|172\.6[4-9]\.|172\.7[01]\.|131\.0\.72\.)'; then
+        ok "Detected ${CDN_DOMAIN} resolves to a Cloudflare IP (${__cdn_ip}) — enabling real-IP restore automatically."
+        BEHIND_CF="y"
+    else
+        ok "${CDN_DOMAIN} does not currently resolve to a Cloudflare IP (or DNS lookup failed) — skipping real-IP restore. Enable it later from the firewall menu if you turn on the orange cloud."
+    fi
 
     echo -e "${INFO}=== Inbounds ===${RESET}"
     local DISC; ask_choice DISC "Inbound discovery mode:" \
