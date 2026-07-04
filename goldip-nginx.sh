@@ -171,19 +171,30 @@ ask_file() {
     done
 }
 ask_choice() {
-    local __var="$1" __q="$2" __valid="$3" __ans __c
+    # Usage: ask_choice VAR "Question" "1:Label one" "2:Label two" ...
+    # Prints every numbered label BEFORE reading input — fixes the old bug
+    # where labels were echoed by the caller AFTER ask_choice already
+    # blocked on read, so the user saw bare numbers with no explanation.
+    local __var="$1" __q="$2"; shift 2
+    local -a __labels=("$@")
+    local __valid="" __ans __o __num __text
+    for __o in "${__labels[@]}"; do
+        __num="${__o%%:*}"
+        __valid="${__valid:+${__valid}|}${__num}"
+    done
     while true; do
         echo -e "${INFO}${__q}${RESET}"
-        IFS='|' read -ra __opts <<< "$__valid"
-        for __o in "${__opts[@]}"; do
+        for __o in "${__labels[@]}"; do
+            __num="${__o%%:*}"; __text="${__o#*:}"
             nextcolor
-            echo -e "  ${CURCOLOR}${__o})${RESET}"
+            echo -e "  ${CURCOLOR}${__num}) ${__text}${RESET}"
         done
         read -r __ans
         printf '%s' "$__ans" | grep -qiE "^(${__valid})$" && { printf -v "$__var" '%s' "$__ans"; return 0; }
         warn "Invalid choice."
     done
 }
+
 is_yes() { case "$1" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
 
 strip_scheme() { printf '%s' "$1" | sed -E 's#^https?://##; s#/.*##; s/^[[:space:]]+//; s/[[:space:]]+$//'; }
@@ -866,9 +877,9 @@ gather_inputs() {
     ask_optional BEHIND_CF "Behind Cloudflare CDN? (restore real visitor IP in nginx for the CDN domain)" "[y/N]"
 
     echo -e "${INFO}=== Inbounds ===${RESET}"
-    local DISC; ask_choice DISC "Inbound discovery mode:" "1|2"
-    echo -e "    ${C_PINK}1) Auto (read from x-ui DB)${RESET}"
-    echo -e "    ${C_OLIVE}2) Manual entry${RESET}"
+    local DISC; ask_choice DISC "Inbound discovery mode:" \
+        "1:Auto (read from x-ui DB)" \
+        "2:Manual entry"
 
     [ "$DISC" = "1" ] && { auto_build_locations || warn "Auto-build failed or skipped. Switching to manual."; }
 
@@ -880,10 +891,9 @@ gather_inputs() {
             ask P_PATH "Path" "(e.g. /ws${i})"
             [ "${P_PATH:0:1}" = "/" ] || P_PATH="/$P_PATH"
             ask_number P_PORT "Local Xray port"
-            echo -e "${INFO}Transport:${RESET}"
-            echo -e "    ${C_PINK}1) WebSocket / HTTPUpgrade${RESET}"
-            echo -e "    ${C_OLIVE}2) XHTTP${RESET}"
-            ask_choice P_TYPE "Selection" "1|2"
+            ask_choice P_TYPE "Transport:" \
+                "1:WebSocket / HTTPUpgrade" \
+                "2:XHTTP"
             case "$P_TYPE" in
                 1) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location upgrade "$P_PATH" "$P_PORT" "$PRIMARY")"
                    CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [ws/httpupgrade] ${P_PATH} -> via ${PRIMARY} (manual entry)"
@@ -898,9 +908,9 @@ gather_inputs() {
     fi
 
     echo -e "${INFO}=== Camouflage ===${RESET}"
-    ask_choice CAMO "Camouflage type:" "1|2"
-    echo -e "    ${C_PINK}1) Reverse Proxy (mirror a real website)${RESET}"
-    echo -e "    ${C_OLIVE}2) Local HTML (serve your own index.html)${RESET}"
+    ask_choice CAMO "Camouflage type:" \
+        "1:Reverse Proxy (mirror a real website)" \
+        "2:Local HTML (serve your own index.html)"
     if [ "$CAMO" = "1" ]; then
         ask PROXY_URL "Website to proxy (e.g. example.com)"
         PROXY_HOST=$(strip_scheme "$PROXY_URL"); PROXY_SCHEME="https"
@@ -1116,12 +1126,11 @@ whitelist_goldip() {
 setup_firewall() {
     command -v ufw >/dev/null 2>&1 || apt-get install -y ufw >/dev/null
 
-    echo -e "${INFO}CDN Provider:${RESET}"
-    echo -e "    ${C_PINK}1) Cloudflare${RESET}"
-    echo -e "    ${C_OLIVE}2) ArvanCloud${RESET}"
-    echo -e "    ${C_LPINK}3) Both${RESET}"
-    echo -e "    ${C_TEALGREY}4) Custom${RESET}"
-    local CDN_CHOICE; ask_choice CDN_CHOICE "Selection" "1|2|3|4"
+    local CDN_CHOICE; ask_choice CDN_CHOICE "CDN Provider:" \
+        "1:Cloudflare" \
+        "2:ArvanCloud" \
+        "3:Both" \
+        "4:Custom"
     local RANGES="" RANGES6=""
     case "$CDN_CHOICE" in
         1) fetch_cloudflare_ranges; RANGES="$CF_V4"; RANGES6="$CF_V6" ;;
