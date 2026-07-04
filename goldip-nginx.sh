@@ -1,6 +1,48 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v4.1 (Uncut)
+#  GoldIP Nginx Camouflage Installer & Manager  v4.2 (Uncut)
+#  CHANGELOG v4.2 (fixes reported by operator, on top of v4.1):
+#   - FIX (root cause of "other inbounds stop working when the CDN
+#     camouflage is turned on"): this was almost never a Host-header
+#     problem. v4.1 already restricted every DB write (Host header,
+#     hosts table, listen/port rewrite) to ws / httpupgrade / xhttp /
+#     splithttp inbounds ONLY, and every other inbound (Reality, gRPC
+#     direct, KCP, plain TCP, Hysteria2, ...) was already skipped and
+#     left untouched. The real cause is that nginx BINDS the HTTPS/HTTP
+#     ports you give it (typically 443/80) on all interfaces for BOTH
+#     CDN_DOMAIN and PANEL_DOMAIN. If ANY skipped/non-CDN inbound (very
+#     commonly a Reality inbound, which by design usually also wants
+#     443) is configured on that same port, only one of nginx or Xray
+#     can actually hold the port — the second one to (re)start loses.
+#     NEW: check_port_collisions() now runs automatically before nginx
+#     is written/restarted, cross-checking nginx's chosen ports against
+#     every skipped inbound's port AND the panel port, and refuses to
+#     proceed silently if it finds a collision.
+#   - HARDENED: the CDN-only filter is now normalized (trim + lowercase)
+#     and centralized in is_cdn_net(), and strip_tls_py / insert_host_py
+#     both independently REFUSE (defense-in-depth) to touch any network
+#     type outside {ws, httpupgrade, xhttp, splithttp} even if somehow
+#     called with something else. Skipped inbounds are now also listed
+#     in the live verification table (clearly marked, not modified) so
+#     you can see, not assume, that they were left alone.
+#   - FIX (root cause of "XHTTP stops working once nginx runs in front
+#     of it", WS unaffected): the camouflage block's sub_filter/gzip
+#     directives are declared at server level (so the reverse-proxied
+#     decoy site can be rewritten anywhere in the response body). WS
+#     is immune to this because after the 101 Switching Protocols
+#     handshake nginx stops treating the connection as regular HTTP, so
+#     none of the server-level body-rewriting directives ever apply to
+#     it again. XHTTP, however, is a plain chunked HTTP request/response
+#     transport end-to-end — it silently INHERITED the server-level
+#     sub_filter (and nginx's default response/request buffering),
+#     which corrupts/stalls XHTTP's streamed bidirectional bodies.
+#     FIX: every ws/xhttp location now explicitly sets `sub_filter off;`
+#     and the xhttp location additionally sets `proxy_buffering off;`,
+#     `proxy_request_buffering off;`, `proxy_cache off;`,
+#     `client_max_body_size 0;`, and `proxy_set_header Connection "";`.
+#   - FIX: alpn_for_net() now advertises h2 before http/1.1 for
+#     xhttp/splithttp (["h2","http/1.1"]) since XHTTP performs (and in
+#     some modes only works correctly) over HTTP/2.
 #  CHANGELOG v4.1 (on top of v4.0's backend Host-header fix):
 #   - NEW: nginx now also writes a dedicated TLS server block for
 #     PANEL_DOMAIN, using the SAME shared certificate as CDN_DOMAIN
@@ -103,6 +145,27 @@ fix()  { echo -e "${FIX_BG} FIXED ${RESET} ${C_CYAN2}$1${RESET}"; }
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 CAMO_ROOT="/var/www/goldip"
 GOLDIP_TRUSTED="goldip.net"
+
+# ============================================================
+# NEW v4.2: the ONLY Xray transport ("network") types this script is
+# EVER allowed to touch — rewrite listen/port, strip TLS, force the
+# transport-level Host header, or write CDN "hosts" rows for. Every
+# other inbound (tcp/reality, grpc, kcp, quic, hysteria2, ...) must be
+# left 100% untouched, on its original port, with its original
+# security settings. is_cdn_net() is the single source of truth used
+# everywhere in this script (bash side); strip_tls_py / insert_host_py
+# independently re-check the same list on the Python/DB side as
+# defense-in-depth.
+# ============================================================
+CDN_ALLOWED_NETS="ws httpupgrade xhttp splithttp"
+is_cdn_net() {
+    local n
+    n=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    case " $CDN_ALLOWED_NETS " in
+        *" $n "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 CF_V4_DEFAULT="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22"
 CF_V6_DEFAULT="2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
@@ -209,7 +272,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v4.1 (Uncut)
+    N G I N X   C A M O U F L A G E   v4.2 (Uncut)
 ==========================================================
 EOF
 }
@@ -251,13 +314,38 @@ install_nginx() {
 # (never passes through $host), guaranteeing the backend xray inbound
 # always sees the CDN domain regardless of what a client sent, and
 # guaranteeing the panel domain can never leak into inbound routing.
+#
+# v4.2 FIX: both branches now explicitly set `sub_filter off;`. The
+# camouflage block (see _build_camo_block) declares sub_filter/gzip
+# directives at SERVER level so they can rewrite the decoy site's body
+# anywhere in that server. Nginx directive inheritance means every
+# location in that server — including these ws/xhttp locations —
+# silently inherited them too. WS survives this because after the 101
+# Switching Protocols handshake nginx no longer treats the connection
+# as HTTP, so body-rewriting directives never actually run against it.
+# XHTTP is a plain chunked HTTP request/response transport the entire
+# time, so it WAS having its bidirectional streamed body passed through
+# sub_filter's buffering/matching engine — which is almost certainly
+# why XHTTP broke while WS kept working. The xhttp branch additionally
+# disables proxy/request buffering (XHTTP relies on low-latency,
+# real-time delivery of chunked stream-up/stream-down bodies; nginx's
+# default buffering can stall or truncate them), disables proxy_cache,
+# raises client_max_body_size (default 1m can trigger 413 errors on
+# XHTTP's larger POST chunks), and clears the Connection header (avoids
+# stale keep-alive state leaking into the persistent XHTTP channel).
 make_location() {
     local t="$1" p="$2" port="$3" hostheader="$4"
     [ "${p:0:1}" != "/" ] && p="/$p"
     if [ "$t" = "xhttp" ]; then
         printf '    location %s {\n' "$p"
+        printf '        sub_filter off;\n'
+        printf '        proxy_buffering off;\n'
+        printf '        proxy_request_buffering off;\n'
+        printf '        proxy_cache off;\n'
+        printf '        client_max_body_size 0;\n'
         printf '        proxy_pass http://127.0.0.1:%s;\n' "$port"
         printf '        proxy_http_version 1.1;\n'
+        printf '        proxy_set_header Connection "";\n'
         printf '        proxy_set_header Host %s;\n' "$hostheader"
         printf '        proxy_set_header X-Real-IP $remote_addr;\n'
         printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
@@ -268,6 +356,7 @@ make_location() {
         printf '    }\n'
     else
         printf '    location %s {\n' "$p"
+        printf '        sub_filter off;\n'
         printf '        proxy_pass http://127.0.0.1:%s;\n' "$port"
         printf '        proxy_http_version 1.1;\n'
         printf '        proxy_set_header Upgrade $http_upgrade;\n'
@@ -292,9 +381,12 @@ free_port() {
 }
 
 # ---------------- Database Python Scripts ----------------
+# v4.2: h2 is now advertised FIRST for xhttp/splithttp — XHTTP performs
+# best (and in some client/server mode combinations only works
+# correctly at all) over HTTP/2, so clients should prefer it.
 alpn_for_net() {
     case "$1" in
-        xhttp|splithttp) printf '["http/1.1","h2"]' ;;
+        xhttp|splithttp) printf '["h2","http/1.1"]' ;;
         *) printf '["http/1.1"]' ;;
     esac
 }
@@ -304,10 +396,20 @@ alpn_for_net() {
 # code path where PANEL_DOMAIN can end up here — callers only ever have
 # $PRIMARY (== CDN_DOMAIN) in scope at the call site (see auto_build_locations).
 # This writes the x-ui "hosts" table used for QR/subscription LINK TEXT only.
+#
+# v4.2: defense-in-depth — refuses to write anything unless the network
+# type passed in $3 is one of the CDN-eligible transports, even though
+# every caller already filters this on the bash side first.
 insert_host_py() {
     python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYEOF'
 import sqlite3, sys, time
 db_path, inbound_id, remark, cdn_host, port, sni, alpn_json = sys.argv[1:8]
+
+ALLOWED_NETS = {"ws", "xhttp", "splithttp", "httpupgrade"}
+if remark not in ALLOWED_NETS:
+    print(f"ERROR: refused to write CDN host entry for non-CDN network type '{remark}'", file=sys.stderr)
+    sys.exit(1)
+
 now_ms = int(time.time() * 1000)
 try:
     con = sqlite3.connect(db_path)
@@ -339,6 +441,9 @@ PYEOF
 # showed CDN_DOMAIN. This function now force-writes the transport
 # Host header to cdn_host in the SAME atomic write as the TLS strip,
 # for ws, xhttp/splithttp, and httpupgrade transports.
+#
+# v4.2: defense-in-depth — refuses to touch stream_settings at all
+# unless net is one of the CDN-eligible transports.
 # ============================================================
 strip_tls_py() {
     python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
@@ -346,6 +451,11 @@ import sqlite3, json, sys
 try:
     con = sqlite3.connect(sys.argv[1]); cur = con.cursor()
     inb_id = int(sys.argv[2]); net = sys.argv[3]; cdn_host = sys.argv[4]
+
+    ALLOWED_NETS = {"ws", "xhttp", "splithttp", "httpupgrade"}
+    if net not in ALLOWED_NETS:
+        print(f"ERROR: refused to modify inbound #{inb_id} with non-CDN network type '{net}'", file=sys.stderr)
+        sys.exit(1)
 
     cur.execute("SELECT stream_settings FROM inbounds WHERE id=?", (inb_id,))
     row = cur.fetchone()
@@ -402,6 +512,10 @@ PYEOF
 # that every CDN-routed inbound's transport Host header, the
 # cosmetic hosts.address, AND nginx's own Host header (which we
 # always hardcode to $PRIMARY in make_location) all agree.
+#
+# v4.2: non-CDN inbounds are now ALSO printed (as an explicit
+# SKIPPED row, not silently dropped from the report) so you can see
+# with your own eyes that they were left completely untouched.
 # ============================================================
 verify_cdn_binding_py() {
     python3 - "$1" "$2" <<'PYEOF'
@@ -417,8 +531,9 @@ for iid, remark, listen, port, ss_raw in rows:
         ss = json.loads(ss_raw)
     except Exception:
         continue
-    net = ss.get("network", "")
+    net = ss.get("network", "") or "tcp/other"
     if net not in ("ws", "xhttp", "splithttp", "httpupgrade"):
+        print(f"{iid}|{remark}|{net}|{listen}|{port}|-|-|-|SKIPPED(not-cdn,untouched)")
         continue
     transport_host = ""
     if net == "ws":
@@ -564,6 +679,7 @@ check_cert_covers_domain() {
 CDN_ROUTED_SUMMARY=""
 NONCDN_SUMMARY=""
 HOSTFIX_SUMMARY=""
+SKIPPED_PORTS=""
 
 auto_build_locations() {
     local db=""; for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do [ -f "$c" ] && db="$c" && break; done
@@ -585,18 +701,29 @@ auto_build_locations() {
     LOCATIONS=""; USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""; local added=0
     local -a OP_IDS OP_FPORTS OP_NETS OP_PATHS OP_ALPNS
-    local op_count=0 ltype fport
+    local op_count=0 ltype fport net_norm
 
     for n in $(seq 1 "$idx"); do
         net="${IN_NET[$n]}"; port="${IN_PORT[$n]}"; path="${IN_PATH[$n]}"; id="${IN_ID[$n]}"; remark="${IN_REMARK[$n]}"
 
-        case "$net" in
+        # v4.2: normalized (trim + lowercase) check via the single
+        # source-of-truth is_cdn_net(), instead of a bare case/glob on
+        # the raw value. Anything that is not literally ws / httpupgrade
+        # / xhttp / splithttp is skipped, untouched, and its port is
+        # recorded so check_port_collisions() can warn about the real
+        # reason non-CDN inbounds usually break (a port clash with
+        # nginx), not a Host-header issue.
+        net_norm=$(printf '%s' "$net" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+        if ! is_cdn_net "$net_norm"; then
+            echo -e "${SKIP_BG} SKIPPED (non-CDN) ${RESET} ${net} \"${remark}\" (Port ${port}) — stays DIRECT on ${PANEL_DOMAIN:-server IP}, bypasses nginx/CDN entirely. NOT modified in any way."
+            NONCDN_SUMMARY="${NONCDN_SUMMARY}"$'\n'"  - [${net}] \"${remark}\" on port ${port} -> direct via ${PANEL_DOMAIN:-<server IP>} (NOT behind CDN, left 100% untouched)"
+            SKIPPED_PORTS="${SKIPPED_PORTS} ${port}"
+            continue
+        fi
+
+        case "$net_norm" in
             ws|httpupgrade) ltype="upgrade" ;;
             xhttp|splithttp) ltype="xhttp" ;;
-            *)
-                echo -e "${SKIP_BG} SKIPPED (non-CDN) ${RESET} ${net} \"${remark}\" (Port ${port}) — stays DIRECT on ${PANEL_DOMAIN:-server IP}, bypasses nginx/CDN entirely."
-                NONCDN_SUMMARY="${NONCDN_SUMMARY}"$'\n'"  - [${net}] \"${remark}\" on port ${port} -> direct via ${PANEL_DOMAIN:-<server IP>} (NOT behind CDN)"
-                continue ;;
         esac
 
         [ -z "$path" ] || [ "$path" = "/" ] && continue
@@ -605,14 +732,14 @@ auto_build_locations() {
         TAKEN_PORTS="${TAKEN_PORTS} ${fport}"
 
         op_count=$((op_count+1))
-        OP_IDS[$op_count]="$id"; OP_FPORTS[$op_count]="$fport"; OP_NETS[$op_count]="$net"
-        OP_PATHS[$op_count]="$path"; OP_ALPNS[$op_count]=$(alpn_for_net "$net")
+        OP_IDS[$op_count]="$id"; OP_FPORTS[$op_count]="$fport"; OP_NETS[$op_count]="$net_norm"
+        OP_PATHS[$op_count]="$path"; OP_ALPNS[$op_count]=$(alpn_for_net "$net_norm")
 
         # Host header for this nginx location is ALWAYS CDN_DOMAIN (PRIMARY),
         # explicitly, never the panel domain.
         LOCATIONS="${LOCATIONS}"$'\n'"$(make_location "$ltype" "$path" "$fport" "$PRIMARY")"
-        echo -e "${CDN_BG} CDN-OK ${RESET} ${net} \"${remark}\" ${path} -> 127.0.0.1:${fport} (nginx Host header: ${PRIMARY}, exposed via CDN_DOMAIN:443)"
-        CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [${net}] \"${remark}\" ${path} -> via ${PRIMARY} (CDN-proxied)"
+        echo -e "${CDN_BG} CDN-OK ${RESET} ${net_norm} \"${remark}\" ${path} -> 127.0.0.1:${fport} (nginx Host header: ${PRIMARY}, exposed via CDN_DOMAIN:443)"
+        CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [${net_norm}] \"${remark}\" ${path} -> via ${PRIMARY} (CDN-proxied)"
         added=$((added+1))
     done
 
@@ -695,17 +822,24 @@ check_subscription_domain() {
 # CDN-eligible inbound: transport Host header, hosts.address,
 # hosts.host_header, and a MATCH/MISMATCH verdict against
 # CDN_DOMAIN. This is the "show me, don't tell me" verification.
+#
+# v4.2: non-CDN inbounds are now shown too (verdict
+# SKIPPED(not-cdn,untouched)), colored neutrally rather than as an
+# error, so you can see the full picture in one table.
 # ============================================================
 print_verify_table() {
     local db="$1"
     printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s\n" "ID" "Remark" "Net" "Listen" "Port" "TransportHost" "hosts.address" "Verdict"
     while IFS='|' read -r iid remark net listen port thost haddr hheader verdict; do
         [ -z "$iid" ] && continue
-        if [ "$verdict" = "MATCH" ]; then
-            echo -e "${C_OK}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}"
-        else
-            echo -e "${C_ERR}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}"
-        fi
+        case "$verdict" in
+            MATCH)
+                echo -e "${C_OK}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}" ;;
+            SKIPPED*)
+                echo -e "${C_GOLD}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "-" "-" "$verdict")${RESET}" ;;
+            *)
+                echo -e "${C_ERR}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}" ;;
+        esac
     done < <(verify_cdn_binding_py "$db" "$PRIMARY")
 }
 
@@ -719,14 +853,18 @@ verify_cdn_binding_menu() {
     printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s\n" "ID" "Remark" "Net" "Listen" "Port" "TransportHost" "hosts.address" "Verdict"
     while IFS='|' read -r iid remark net listen port thost haddr hheader verdict; do
         [ -z "$iid" ] && continue
-        if [ "$verdict" = "MATCH" ]; then
-            echo -e "${C_OK}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}"
-        else
-            echo -e "${C_ERR}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}"
-        fi
+        case "$verdict" in
+            MATCH)
+                echo -e "${C_OK}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}" ;;
+            SKIPPED*)
+                echo -e "${C_GOLD}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "-" "-" "$verdict")${RESET}" ;;
+            *)
+                echo -e "${C_ERR}$(printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s" "$iid" "${remark:0:22}" "$net" "$listen" "$port" "${thost:-<empty>}" "${haddr:-<none>}" "$verdict")${RESET}" ;;
+        esac
     done < <(verify_cdn_binding_py "$db" "$CDNIN")
     echo ""
     warn "MISMATCH means the inbound's real WebSocket/XHTTP Host header does NOT equal the CDN domain."
+    warn "SKIPPED means that inbound is NOT ws/xhttp/splithttp/httpupgrade — it was never touched and stays direct."
     warn "Run 'Install / Config website' -> Auto discovery again to force-correct any MISMATCH rows."
 }
 
@@ -784,7 +922,7 @@ JSEOF
 
 # ---------------- Setup Flow ----------------
 gather_inputs() {
-    CDN_ROUTED_SUMMARY=""; NONCDN_SUMMARY=""; HOSTFIX_SUMMARY=""
+    CDN_ROUTED_SUMMARY=""; NONCDN_SUMMARY=""; HOSTFIX_SUMMARY=""; SKIPPED_PORTS=""
 
     echo -e "${INFO}=== Panel Configuration ===${RESET}"
     ask RAW_PANEL "Panel Domain / IP" "(e.g. panel.example.com — used ONLY for the x-ui admin panel + non-CDN inbounds)"
@@ -900,9 +1038,9 @@ gather_inputs() {
                    warn "Manual entry does NOT touch x-ui's internal Host header field. Go into x-ui" ;;
                 2) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location xhttp "$P_PATH" "$P_PORT" "$PRIMARY")"
                    CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [xhttp] ${P_PATH} -> via ${PRIMARY} (manual entry)"
-                   warn "Manual entry does NOT touch x-ui's internal Host header field. Go into x-ui" ;;
+                   warn "Manual entry does NOT touch x-ui's internal Host header field, NOR its ALPN list." ;;
             esac
-            warn "-> panel and set this inbound's WS/XHTTP Host header to ${PRIMARY} manually, or use Auto discovery instead."
+            warn "-> panel and set this inbound's WS/XHTTP Host header (and, for XHTTP, alpn [\"h2\",\"http/1.1\"]) to ${PRIMARY} manually, or use Auto discovery instead."
             i=$((i+1))
         done
     fi
@@ -941,6 +1079,47 @@ detect_http2_syntax() {
     fi
 }
 
+# ============================================================
+# NEW v4.2: THE actual root cause of "other (non-CDN) inbounds stop
+# working once the CDN camouflage is turned on" in the overwhelming
+# majority of reports. It is virtually never a Host-header/DB problem
+# — v4.1 already never touches non ws/xhttp/httpupgrade/splithttp
+# inbounds at all (see is_cdn_net / SKIPPED_PORTS above). It is a
+# PORT CONFLICT: nginx exclusively binds HTTP_PORT/HTTPS_PORT (usually
+# 80/443) on the server for BOTH CDN_DOMAIN and PANEL_DOMAIN. A Reality
+# inbound (by far the most common non-CDN inbound) is very often ALSO
+# configured on port 443, because that's what makes Reality's
+# TLS-camouflage work in the first place. Two processes cannot both
+# bind the same port on the same interface — whichever one (re)starts
+# second loses, and that inbound simply fails to come up. This check
+# surfaces that BEFORE nginx is written/restarted instead of leaving
+# you to guess why Reality "randomly" stopped working.
+# ============================================================
+check_port_collisions() {
+    local conflict=0 p
+    for p in $SKIPPED_PORTS; do
+        if [ "$p" = "$HTTPS_PORT" ] || [ "$p" = "$HTTP_PORT" ]; then
+            err "PORT CONFLICT: a non-CDN inbound is listening on port ${p} — the SAME port nginx is about to bind for ${CDN_DOMAIN}/${PANEL_DOMAIN}."
+            err "nginx and that Xray inbound cannot both hold port ${p} on this server at the same time."
+            err "Whichever one (re)starts second will fail to bind — THIS is almost always why non-CDN inbounds 'stop working', not a Host-header issue."
+            conflict=1
+        fi
+    done
+    if [ "${PANEL_PORT:-}" = "${HTTPS_PORT:-}" ] || [ "${PANEL_PORT:-}" = "${HTTP_PORT:-}" ]; then
+        err "PORT CONFLICT: x-ui panel port (${PANEL_PORT}) is the SAME port nginx is about to bind (${HTTPS_PORT}/${HTTP_PORT})."
+        conflict=1
+    fi
+    if [ "$conflict" -eq 1 ]; then
+        warn "Fix: move the conflicting Xray inbound (or the panel) to a different port, then re-run 'Install / Config website' -> Auto discovery."
+        warn "Reality specifically can be moved off 443 as long as the impersonated destination site also uses that alternate port for the handshake to look consistent."
+        local CONT; ask_optional CONT "Continue writing/restarting nginx anyway? (the conflicting inbound(s) above WILL very likely fail to bind) [y/N]"
+        is_yes "$CONT" || { err "Aborted. Fix the port conflict above and re-run 'Install / Config website'."; return 1; }
+    else
+        ok "No port conflicts detected between nginx (${HTTP_PORT}/${HTTPS_PORT}) and any non-CDN inbound or the panel port."
+    fi
+    return 0
+}
+
 # write_config ONLY ever writes a server block for CDN_DOMAIN (server_name
 # is CDN_DOMAIN, not panel domain). The panel is deliberately left OUT of
 # this nginx vhost so it is never accidentally routed through the
@@ -957,6 +1136,8 @@ write_config() {
         err "http_sub_module is missing. Run option 1 again (it reinstalls nginx-extras) before continuing."
         return 1
     }
+
+    check_port_collisions || return 1
 
     detect_http2_syntax
 
