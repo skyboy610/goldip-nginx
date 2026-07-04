@@ -1,19 +1,4 @@
 #!/bin/bash
-# ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v3.7 (Uncut)
-#  - FIX (v3.7): nginx-extras now installed correctly from the
-#    start (no more silent apt conflict that left http_sub_module
-#    missing -> nginx -t failing -> HTTPS config never applied,
-#    site stuck serving the OLD/HTTP-only config silently).
-#  - FIX (v3.7): write_config no longer swallows nginx -t errors;
-#    failures are printed and propagate up (do_install aborts).
-#  - FIX (v3.7): "listen ... ssl http2;" replaced with version-
-#    aware syntax (nginx >=1.25.1 uses separate "http2 on;").
-#  - Colors Fixed: Success=Green, Error=Red, Prompts=Rotating
-#  - Strictly CDN Only (ws, xhttp, httpupgrade) - gRPC skipped
-#  - Hosts API & xHTTP xPadding Auto-Injection
-#  - Hardened Security & Custom Auto-SSL Path (/root/goldip/)
-# ============================================================
 set -uo pipefail
 
 RESET='\033[0m'
@@ -32,7 +17,6 @@ nextcolor() {
     CURCOLOR="${!name}"
 }
 
-# پیام‌های وضعیت با رنگ ثابت (سبز، زرد، قرمز)
 ok()   { echo -e "${OK_BG} OK ${RESET} \033[1;32m$1${RESET}"; }
 warn() { echo -e "${WARN_BG} WARN ${RESET} \033[1;33m$1${RESET}"; }
 err()  { echo -e "${ERR_BG} ERROR ${RESET} \033[1;31m$1${RESET}"; }
@@ -47,7 +31,6 @@ ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.11
 ARVAN_V6_DEFAULT=""
 CF_V4=""; CF_V6=""; ARVAN_V4=""; ARVAN_V6=""
 
-# ---------------- Input helpers (با رنگ چرخشی) ----------------
 ask() {
     local __var="$1" __q="$2" __hint="${3:-}" __ans __c
     while true; do
