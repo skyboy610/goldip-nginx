@@ -1669,7 +1669,7 @@ menu() {
         echo -e "  ${C_ORANGE}10) Firewall status${RESET}"
         echo -e "  ${C_DEEPTEAL}11) Fix auto-start (persistence)${RESET}"
         echo -e "  ${C_CYAN2}12) Verify CDN Host-header binding (live DB check)${RESET}"
-        echo -e "  ${C_MAGENTA2}13) Diagnose delayed inbound disconnects (disk/crash/expiry/firewall)${RESET}"
+        echo -e "  ${C_MAGENTA2}13) Diagnose delayed inbound disconnects (crash/expiry/firewall)${RESET}"
         echo -e "  ${C_ERR}14) FULL Nginx uninstall + cleanup${RESET}"
         echo -e "  ${C_ERR}0)  Exit${RESET}"
         local CH; ask_optional CH "Choose"
