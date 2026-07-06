@@ -131,7 +131,7 @@ C_MAGENTA2='\033[1;38;5;201m'
 C_AMBER='\033[1;38;5;214m'
 
 TITLE='\033[1;36m'; INFO='\033[1;34m'
-OK_BG='\033[42m\033[97m'; WARN_BG='\033[43m\033[97m'; ERR_BG='\033[41m\033[97m'
+OK_BG='\033[42m\033[30m'; WARN_BG='\033[43m\033[97m'; ERR_BG='\033[41m\033[97m'
 
 SKIP_BG='\033[1;30;43m'   # yellow bg, black text -> skipped (non-CDN) inbound
 CDN_BG='\033[1;30;42m'    # green bg,  black text -> CDN-compatible inbound
@@ -704,7 +704,7 @@ PYEOF
 verify_cdn_binding_menu() {
     local db=""; for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do [ -f "$c" ] && db="$c" && break; done
     [ -z "$db" ] && { err "x-ui database not found."; return 1; }
-    local CDNIN; ask CDNIN "CDN domain to verify against" "(e.g. cdn.example.com)"
+    local CDNIN; ask CDNIN "CDN Domain"
     CDNIN=$(strip_scheme "$CDNIN")
     echo -e "${INFO}--- Live binding check for CDN_DOMAIN=${CDNIN} ---${RESET}"
     printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s\n" "ID" "Remark" "Net" "Listen" "Port" "TransportHost" "hosts.address" "Verdict"
@@ -952,13 +952,13 @@ find_index_html_auto() {
 gather_inputs() {
     CDN_ROUTED_SUMMARY=""; NONCDN_SUMMARY=""; HOSTFIX_SUMMARY=""
 
-    echo -e "${INFO}=== Panel Configuration ===${RESET}"
-    ask RAW_PANEL "Panel Domain / IP" "(e.g. panel.example.com -- used for the x-ui admin panel + non-CDN inbounds)"
+    echo -e "${INFO}=== Panel ===${RESET}"
+    ask RAW_PANEL "Panel Domain"
     PANEL_DOMAIN=$(strip_scheme "$RAW_PANEL"); PANEL_DOMAIN=$(strip_port "$PANEL_DOMAIN")
-    ask_port PANEL_PORT "Panel Port (the port x-ui itself listens on)" 2053
+    ask_port PANEL_PORT "Panel Port" 2053
 
-    echo -e "${INFO}=== CDN Configuration ===${RESET}"
-    ask RAW_CDN "CDN Domain" "(e.g. cdn.example.com -- this is the ONLY domain proxied through Cloudflare/Arvan)"
+    echo -e "${INFO}=== CDN ===${RESET}"
+    ask RAW_CDN "CDN Domain"
     CDN_DOMAIN=$(strip_scheme "$RAW_CDN"); PRIMARY="$CDN_DOMAIN"
     ask_port HTTPS_PORT "HTTPS Port" 443
     ask_port HTTP_PORT  "HTTP Port"  80
@@ -1046,13 +1046,13 @@ gather_inputs() {
     [ "$DISC" = "1" ] && { auto_build_locations || warn "Auto-build failed or skipped. Switching to manual."; }
 
     if [ "$DISC" = "2" ] || [ -z "$LOCATIONS" ]; then
-        ask_number NIN "How many CDN inbounds to add to Nginx?"
+        ask_number NIN "Inbound Count"
         local i=1
         while [ "$i" -le "$NIN" ]; do
             echo -e "${INFO}--- Inbound #${i} ---${RESET}"
-            ask P_PATH "Path" "(e.g. /ws${i})"
+            ask P_PATH "Path"
             [ "${P_PATH:0:1}" = "/" ] || P_PATH="/$P_PATH"
-            ask_number P_PORT "Local Xray port"
+            ask_number P_PORT "Local Port"
             local P_TYPE
             ask_choice P_TYPE "Transport:" \
                 "1:WebSocket / HTTPUpgrade" \
@@ -1098,7 +1098,32 @@ gather_inputs() {
             warn "No index.html found automatically in common locations (/root, /root/goldip, /var/www/html, current dir)."
             ask_file HTML_FILE "Path to index.html"
         fi
-        mkdir -p "$CAMO_ROOT"; cp "$HTML_FILE" "$CAMO_ROOT/index.html"
+
+        # FIX: the old code ran `cp` with no success check and no
+        # existence/size check. A failed cp (permissions, disk full,
+        # unreadable source) left CAMO_ROOT/index.html missing while the
+        # rest of the install kept going, only to fail much later with a
+        # confusing nginx error. Now every step is verified immediately
+        # and any failure stops the install with a clear message instead
+        # of silently continuing.
+        if [ ! -f "$HTML_FILE" ]; then
+            err "index.html source file not found: ${HTML_FILE}"
+            return 1
+        fi
+        if [ ! -s "$HTML_FILE" ]; then
+            err "index.html source file is empty: ${HTML_FILE}"
+            return 1
+        fi
+        mkdir -p "$CAMO_ROOT" || { err "Could not create ${CAMO_ROOT}."; return 1; }
+        if ! cp "$HTML_FILE" "$CAMO_ROOT/index.html"; then
+            err "Failed to copy ${HTML_FILE} to ${CAMO_ROOT}/index.html (permissions or disk space?)."
+            return 1
+        fi
+        if [ ! -s "$CAMO_ROOT/index.html" ]; then
+            err "Copy completed but ${CAMO_ROOT}/index.html is missing or empty. Aborting."
+            return 1
+        fi
+        ok "index.html installed to ${CAMO_ROOT}/index.html."
         CAMO_BLOCK="    location / { root ${CAMO_ROOT}; index index.html; }"
     fi
 }
@@ -1403,15 +1428,15 @@ setup_firewall() {
         1) fetch_cloudflare_ranges; RANGES="$CF_V4"; RANGES6="$CF_V6" ;;
         2) fetch_arvan_ranges; RANGES="$ARVAN_V4"; RANGES6="$ARVAN_V6" ;;
         3) fetch_cloudflare_ranges; fetch_arvan_ranges; RANGES="$CF_V4 $ARVAN_V4"; RANGES6="$CF_V6 $ARVAN_V6" ;;
-        4) ask RANGES "IPv4 CIDRs (space-separated)"; ask_optional RANGES6 "IPv6 CIDRs" ;;
+        4) ask RANGES "IPv4 CIDRs"; ask_optional RANGES6 "IPv6 CIDRs" ;;
     esac
 
     local SSH_PORT FW_HTTPS FW_HTTP TUN_PORT FOREIGN_IP=""
-    ask_port SSH_PORT "SSH port" 22
-    ask_port FW_HTTPS "HTTPS port exposed to CDN" 443
-    ask_port FW_HTTP  "HTTP port exposed to CDN"  80
-    ask_port_optional TUN_PORT "Tunnel port (e.g. 8443)"
-    [ -n "$TUN_PORT" ] && ask_optional FOREIGN_IP "Tunnel allowed from IP" "(blank = any)"
+    ask_port SSH_PORT "SSH Port" 22
+    ask_port FW_HTTPS "HTTPS Port" 443
+    ask_port FW_HTTP  "HTTP Port"  80
+    ask_port_optional TUN_PORT "Tunnel Port"
+    [ -n "$TUN_PORT" ] && ask_optional FOREIGN_IP "Tunnel IP"
 
     ufw --force reset >/dev/null; ufw default deny incoming >/dev/null; ufw default allow outgoing >/dev/null
     ufw allow "${SSH_PORT}/tcp" >/dev/null
@@ -1601,7 +1626,7 @@ full_uninstall() {
 }
 
 uninstall_domain() {
-    local D; ask D "Domain config to remove"
+    local D; ask D "Domain"
     rm -f "${NGINX_CONF_DIR}/${D}.conf"
     command -v nginx >/dev/null 2>&1 && nginx -t 2>/dev/null && systemctl reload nginx && ok "Removed." || ok "Removed (nginx not running)."
 }
@@ -1657,20 +1682,20 @@ do_install() {
 menu() {
     while true; do
         clear; echo -e "${TITLE}"; header; echo -e "${RESET}"
-        echo -e "  ${C_PINK}1)  Install / Config website${RESET}"
-        echo -e "  ${C_OLIVE}2)  Start Nginx${RESET}"
-        echo -e "  ${C_LPINK}3)  Stop Nginx${RESET}"
-        echo -e "  ${C_TEALGREY}4)  Restart Nginx${RESET}"
-        echo -e "  ${C_CHOC}5)  Reload Nginx${RESET}"
+        echo -e "  ${C_PINK}1)  Install / Config${RESET}"
+        echo -e "  ${C_OLIVE}2)  Start${RESET}"
+        echo -e "  ${C_LPINK}3)  Stop${RESET}"
+        echo -e "  ${C_TEALGREY}4)  Restart${RESET}"
+        echo -e "  ${C_CHOC}5)  Reload${RESET}"
         echo -e "  ${C_LCHOC}6)  Status${RESET}"
-        echo -e "  ${C_SKY}7)  View logs${RESET}"
-        echo -e "  ${C_PURPLE}8)  Remove domain config${RESET}"
-        echo -e "  ${C_GOLD}9)  Setup firewall${RESET}"
-        echo -e "  ${C_ORANGE}10) Firewall status${RESET}"
-        echo -e "  ${C_DEEPTEAL}11) Fix auto-start (persistence)${RESET}"
-        echo -e "  ${C_CYAN2}12) Verify CDN Host-header binding (live DB check)${RESET}"
-        echo -e "  ${C_MAGENTA2}13) Diagnose delayed inbound disconnects (crash/expiry/firewall)${RESET}"
-        echo -e "  ${C_ERR}14) FULL Nginx uninstall + cleanup${RESET}"
+        echo -e "  ${C_SKY}7)  View Logs${RESET}"
+        echo -e "  ${C_PURPLE}8)  Remove Domain${RESET}"
+        echo -e "  ${C_GOLD}9)  Setup Firewall${RESET}"
+        echo -e "  ${C_ORANGE}10) Firewall Status${RESET}"
+        echo -e "  ${C_DEEPTEAL}11) Fix Auto-Start${RESET}"
+        echo -e "  ${C_CYAN2}12) Verify Binding${RESET}"
+        echo -e "  ${C_MAGENTA2}13) Diagnose Issues${RESET}"
+        echo -e "  ${C_ERR}14) Full Uninstall${RESET}"
         echo -e "  ${C_ERR}0)  Exit${RESET}"
         local CH; ask_optional CH "Choose"
         case "$CH" in
