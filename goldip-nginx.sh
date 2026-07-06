@@ -1,108 +1,6 @@
 #!/bin/bash
 # ============================================================
 #  GoldIP Nginx Camouflage Installer & Manager  v4.3 (Uncut)
-#  CHANGELOG v4.3 -- investigated "CDN-routed inbounds stop working
-#  after several days":
-#   - CONFIRMED SCRIPT BUG: write_config() created a dedicated
-#     access_log/error_log per domain but never registered a
-#     logrotate policy for those exact files. If the distro's
-#     default /etc/logrotate.d/nginx is ever missing or replaced,
-#     these logs grow unbounded; over days/weeks this exhausts
-#     disk space, and nginx then fails unpredictably (cannot write
-#     logs / open file descriptors on ENOSPC) -- surfacing as
-#     inbounds "randomly" going down after some time. FIX: this
-#     script now installs its own /etc/logrotate.d/goldip-nginx
-#     (daily, 14 rotations, compress, USR1 reopen) covering every
-#     log file it creates, independent of the distro package.
-#   - NEW: menu option "Diagnose delayed inbound disconnects" --
-#     checks disk usage, oversized pre-existing logs, nginx crash/
-#     OOM history in the systemd journal, x-ui client expiry/
-#     traffic-quota exhaustion (an Xray-core-level cause completely
-#     unrelated to nginx that produces an identical symptom), live
-#     listen-state of each CDN inbound's actual port, and UFW state
-#     for those ports. Reports verified facts from the live system
-#     instead of guessing which cause applies to you.
-#  CHANGELOG v4.2 -- root-cause fixes for three confirmed bugs:
-#
-#  BUG A: "WordPress plugin can only reach the panel subdomain
-#  when a proxy/VPN is on; HTTPS to the panel never works, even
-#  though a valid Wildcard cert exists."
-#    ROOT CAUSE: write_config() in v3.9/v4.1 NEVER wrote an nginx
-#    server block for PANEL_DOMAIN at all -- only for CDN_DOMAIN.
-#    x-ui was left to serve itself directly on PANEL_PORT over
-#    plain HTTP, with no TLS termination anywhere for the panel
-#    hostname. Any HTTPS request to PANEL_DOMAIN:443 therefore hit
-#    nginx's TLS SNI matching, found no server_name matching the
-#    panel domain, and fell through to the default_server
-#    catch-all, which does `return 444` (connection closed, no
-#    response) per RFC-less nginx convention. That is indistin-
-#    guishable from a hang/timeout to any HTTPS client -- exactly
-#    what was reported. The wildcard certificate was valid and
-#    covered the panel subdomain (confirmed by
-#    check_cert_covers_domain), but was never loaded into any
-#    server block serving that hostname, so it was never used.
-#    The only way to reach the panel was hitting PANEL_PORT
-#    directly and unencrypted, which only worked when a
-#    proxy/VPN/tunnel bridged that raw port -- matching the
-#    reported symptom exactly.
-#    FIX: write_config() now ALWAYS writes a dedicated HTTPS
-#    server block for PANEL_DOMAIN (when different from
-#    CDN_DOMAIN), reusing the SAME validated certificate (the
-#    wildcard already confirmed to cover both names), and
-#    reverse-proxying to 127.0.0.1:PANEL_PORT over HTTP/1.1 with
-#    the real $host preserved. This block carries ZERO ws/xhttp/
-#    httpupgrade locations -- it is dedicated purely to the panel,
-#    so Reality/gRPC/Hysteria2/etc. inbounds remain fully
-#    untouched, exactly as required.
-#
-#  BUG B: "location / matching logic is wrong; sub_filter logic
-#  collides with location /."
-#    ROOT CAUSE: _build_camo_block() emitted `gzip off;`,
-#    `sub_filter_once off;`, `sub_filter_types ...;` and every
-#    `sub_filter '...' '';` directive OUTSIDE the `location / {}`
-#    block -- at server-block scope, textually before the
-#    location. Per ngx_http_sub_module (official docs: "The
-#    sub_filter directives are inherited from the previous
-#    configuration level if and only if there are no sub_filter
-#    directives defined on the current level"), any directive set
-#    at server{} scope is inherited by EVERY location in that
-#    server block that does not define its own -- including the
-#    ws/xhttp/httpupgrade locations, which have no reason to ever
-#    run HTML text substitution against binary WebSocket/XHTTP
-#    payloads. This is architecturally wrong regardless of whether
-#    sub_filter_types happens to exclude the relevant MIME types in
-#    a given run, and is the exact defect described.
-#    FIX: gzip off, sub_filter_once, sub_filter_types, and every
-#    sub_filter directive are now emitted strictly INSIDE
-#    `location / { ... }`, at that location's own scope, so they
-#    can never leak to sibling locations by inheritance.
-#
-#  BUG C: XHTTP/WS location matching priority.
-#    ROOT CAUSE / VERIFICATION: per ngx_http_core_module (official
-#    docs, "Location" section), regex locations always take
-#    priority over prefix locations unless a prefix location is
-#    declared with the "^~" modifier, in which case nginx stops
-#    searching for a better (regex) match once that prefix wins.
-#    All ws/xhttp/httpupgrade locations must therefore be declared
-#    with "^~" so they are guaranteed to win outright over the
-#    catch-all "location /" and over any future regex location,
-#    instead of relying on "longest prefix wins" (which is only
-#    nginx's tie-breaker among competing plain-prefix locations,
-#    not a guarantee against regex locations).
-#    FIX: every ws/httpupgrade/xhttp location is now declared as
-#    "location ^~ /path { ... }". "location /" for camouflage
-#    remains a plain prefix location (correct -- it is the
-#    catch-all fallback and must never claim priority over the
-#    specific inbound paths).
-#
-#  Everything else (panel/CDN domain separation, hardcoded Host
-#  header override for ws/httpupgrade, grpc_pass for xhttp per the
-#  official XTLS/Xray-examples/VLESS-XHTTP3-Nginx reference,
-#  Xray-core-actual Host field fix inside stream_settings, shared
-#  wildcard cert validation via SAN inspection, default_server
-#  catch-all, colored menu/logging, full uninstall, firewall,
-#  real-IP restore, watchdog/persistence) is carried over unchanged
-#  from v4.1 and re-verified against nginx -t before shipping.
 # ============================================================
 set -uo pipefail
 
@@ -133,9 +31,9 @@ C_AMBER='\033[1;38;5;214m'
 TITLE='\033[1;36m'; INFO='\033[1;34m'
 OK_BG='\033[42m\033[30m'; WARN_BG='\033[43m\033[97m'; ERR_BG='\033[41m\033[97m'
 
-SKIP_BG='\033[1;30;43m'   # yellow bg, black text -> skipped (non-CDN) inbound
-CDN_BG='\033[1;30;42m'    # green bg,  black text -> CDN-compatible inbound
-FIX_BG='\033[1;30;46m'    # cyan bg,   black text -> Host-header fix applied
+SKIP_BG='\033[1;30;43m'
+CDN_BG='\033[1;30;42m'
+FIX_BG='\033[1;30;46m'
 
 PALETTE=(C_PINK C_OLIVE C_LPINK C_TEALGREY C_CHOC C_LCHOC C_SKY C_PURPLE C_GOLD C_ORANGE C_DEEPTEAL C_SLATE C_ROSE C_LIME C_CYAN2 C_MAGENTA2 C_AMBER)
 __cidx=0
@@ -160,6 +58,40 @@ CF_V6_DEFAULT="2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:
 ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.116.16/30 2.144.3.128/28 37.32.16.0/27 37.32.17.0/27 37.32.18.0/27 37.32.19.0/27 78.157.36.112/28 94.101.182.0/27 94.101.183.0/28"
 ARVAN_V6_DEFAULT=""
 CF_V4=""; CF_V6=""; ARVAN_V4=""; ARVAN_V6=""
+
+# ---------------- Spinner (safe for background use) ----------------
+# FIX (v4.4): previous versions of this script had a background spinner
+# that inherited the terminal's stdin, which could steal keystrokes meant
+# for the next `read` prompt once the spinner process was reaped. This
+# implementation always redirects the spinner's own stdin from /dev/null
+# and only ever reads/writes to the terminal (stderr) from the spinner
+# loop itself, so it can never race with ask()/read in the main shell.
+_SPINNER_PID=""
+spinner_start() {
+    local msg="$1"
+    ( 
+        local frames='|/-\' i=0
+        tput civis 2>/dev/null
+        while :; do
+            i=$(( (i+1) % 4 ))
+            printf "\r${INFO}  [%s] %s...${RESET}" "${frames:$i:1}" "$msg" >&2
+            sleep 0.15
+        done
+    ) < /dev/null >&2 &
+    _SPINNER_PID=$!
+    disown "$_SPINNER_PID" 2>/dev/null
+}
+spinner_stop() {
+    local ok_msg="${1:-}"
+    if [ -n "$_SPINNER_PID" ]; then
+        kill "$_SPINNER_PID" >/dev/null 2>&1
+        wait "$_SPINNER_PID" 2>/dev/null
+        _SPINNER_PID=""
+    fi
+    printf "\r\033[K" >&2
+    tput cnorm 2>/dev/null
+    [ -n "$ok_msg" ] && ok "$ok_msg"
+}
 
 # ---------------- Input helpers ----------------
 ask() {
@@ -221,9 +153,9 @@ ask_file() {
         printf -v "$__var" '%s' "$__ans"; return 0
     done
 }
-# ask_choice VAR "Question" "1:Label one" "2:Label two" ...
-# Labels are printed BEFORE the read, so the user always sees what
-# each number means at the moment they are asked -- never after.
+# ask_choice VAR "Question" "1:Label" "2:Label" ...
+# v4.4: labels are now short, no parenthetical explanations -- only a
+# default (if any) is shown in parentheses, per requested style.
 ask_choice() {
     local __var="$1" __q="$2"; shift 2
     local -a __labels=("$@")
@@ -256,7 +188,7 @@ cat <<'EOF'
  | |  _ / _ \| |/ _` || || |_) |
  | |_| | (_) | | (_| || ||  __/
   \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v4.3 (Uncut)
+    N G I N X   C A M O U F L A G E   v4.4
 ==========================================================
 EOF
 }
@@ -266,6 +198,8 @@ require_root() { [ "$(id -u)" -eq 0 ] || { err "Run this script as root."; exit 
 ensure_sqlite3() { command -v sqlite3 >/dev/null 2>&1 || apt-get install -y sqlite3 >/dev/null 2>&1; }
 
 # ---------------- install nginx WITH http_sub_module + http_v2_module ----------------
+# v4.4: wrapped in a spinner so the user can see the install is actually
+# progressing instead of appearing to hang during apt-get.
 install_nginx() {
     if command -v nginx >/dev/null 2>&1; then
         if nginx -V 2>&1 | grep -q 'http_sub_module'; then
@@ -275,13 +209,20 @@ install_nginx() {
         warn "Nginx is installed but missing http_sub_module. Reinstalling as nginx-extras..."
     fi
 
-    apt-get update -y >/dev/null 2>&1
-    apt-get remove -y nginx nginx-core nginx-light nginx-full nginx-common >/dev/null 2>&1
-    apt-get autoremove -y >/dev/null 2>&1
+    spinner_start "Updating package lists"
+    apt-get update -y >/tmp/goldip_nginx_prep.log 2>&1
+    spinner_stop
 
+    spinner_start "Removing conflicting nginx packages"
+    apt-get remove -y nginx nginx-core nginx-light nginx-full nginx-common >>/tmp/goldip_nginx_prep.log 2>&1
+    apt-get autoremove -y >>/tmp/goldip_nginx_prep.log 2>&1
+    spinner_stop
+
+    spinner_start "Installing nginx-extras (this can take a minute)"
     if apt-get install -y nginx-extras > /tmp/goldip_nginx_install.log 2>&1; then
-        ok "Nginx (extras build, includes http_sub_module) installed."
+        spinner_stop "Nginx (extras build, includes http_sub_module) installed."
     else
+        spinner_stop
         err "Failed to install nginx-extras. Last 20 lines of apt log:"
         tail -n 20 /tmp/goldip_nginx_install.log
         exit 1
@@ -295,29 +236,6 @@ install_nginx() {
 }
 
 # ---------------- Location Builder ----------------
-# BUG C FIX: every ws/httpupgrade/xhttp location now uses "location ^~ /path"
-# instead of a plain prefix "location /path". Per the official nginx docs
-# (ngx_http_core_module, "Location" directive): a prefix location declared
-# with "^~" wins outright over any regex location once nginx determines it
-# is the longest matching prefix -- nginx does not even attempt regex
-# matching after that. Without "^~", nginx would still check for a better
-# regex match after finding the longest prefix, which is unnecessary risk
-# once camouflage or future config adds regex locations to the same
-# server block. This guarantees these paths can never be shadowed.
-#
-# Host header for ws/httpupgrade is hardcoded to CDN_DOMAIN explicitly
-# (never passes through $host), guaranteeing the backend xray inbound
-# always sees the CDN domain regardless of what a client sent, and
-# guaranteeing the panel domain can never leak into inbound routing.
-#
-# XHTTP uses grpc_pass (nginx's built-in ngx_http_grpc_module, part of
-# stock nginx core) because XHTTP's stream-up/stream-one modes carry real
-# HTTP/2 frames, the same transport family as gRPC -- NOT plain HTTP/1.1
-# request/response, which is what proxy_pass + proxy_http_version 1.1
-# would (incorrectly) treat it as. This matches the official reference
-# nginx.conf in XTLS/Xray-examples/VLESS-XHTTP3-Nginx exactly: grpc_pass,
-# client_max_body_size 0, extended timeouts, no forced Host header (XHTTP's
-# own protocol framing carries what it needs).
 make_location() {
     local t="$1" p="$2" port="$3" hostheader="$4"
     [ "${p:0:1}" != "/" ] && p="/$p"
@@ -357,6 +275,13 @@ free_port() {
     done; return 1
 }
 
+# random short path generator used when an inbound has no path or "/"
+# (see BUG D fix below in auto_build_locations)
+gen_random_path() {
+    local id="${1:-0}"
+    printf '/gip%02x%04x' "$((id % 256))" "$((RANDOM % 65536))"
+}
+
 # ---------------- Database Python Scripts ----------------
 alpn_for_net() {
     case "$1" in
@@ -365,15 +290,29 @@ alpn_for_net() {
     esac
 }
 
-# insert_host_py takes address/sni/host_header as ONE explicit parameter
-# ($4 = cdn_host) that the caller MUST pass as CDN_DOMAIN. There is no
-# code path where PANEL_DOMAIN can end up here -- callers only ever have
-# $PRIMARY (== CDN_DOMAIN) in scope at the call site. This writes the
-# x-ui "hosts" table used for QR/subscription LINK TEXT only.
+# insert_host_py: writes the x-ui "hosts" table row used for QR/subscription
+# LINK TEXT. Takes the CDN host, port, sni, alpn AND (v4.4 FIX) the actual
+# inbound path as explicit parameters.
+#
+# *** BUG D (root cause of "no CDN inbound works at all") ***
+# In v4.3 this function ALWAYS inserted an empty string '' into the
+# hosts.path column, regardless of what path the inbound actually used.
+# hosts.path is the field x-ui reads when it builds the exported
+# vless/vmess subscription link / QR code for a client. Every real client
+# app connects using EXACTLY that exported link. With path always blank,
+# every generated client link told the client to connect on "/" (the
+# default), while nginx only forwards traffic to the ws/xhttp/httpupgrade
+# backend on locations matching the INBOUND'S REAL path (e.g. "/ws1")
+# using "location ^~ /ws1". A client request for "/" never matches that
+# specific location and instead falls through to "location /" -- the
+# camouflage block -- so the client always got camouflage HTML (or the
+# reverse-proxied decoy site) back instead of ever reaching Xray. This
+# reproduces EXACTLY on every CDN-routed inbound, every time, which is
+# why none of them worked. FIX: hosts.path is now always the real path.
 insert_host_py() {
-    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYEOF'
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" <<'PYEOF'
 import sqlite3, sys, time
-db_path, inbound_id, remark, cdn_host, port, sni, alpn_json = sys.argv[1:8]
+db_path, inbound_id, remark, cdn_host, port, sni, alpn_json, path = sys.argv[1:9]
 now_ms = int(time.time() * 1000)
 try:
     con = sqlite3.connect(db_path)
@@ -383,8 +322,8 @@ try:
             inbound_id, sort_order, remark, server_description, is_disabled, is_hidden,
             address, port, security, sni, host_header, path, alpn, fingerprint, override_sni_from_address,
             keep_sni_blank, allow_insecure, created_at, updated_at
-        ) VALUES (?, 0, ?, '', 0, 0, ?, ?, 'tls', ?, ?, '', ?, 'chrome', 1, 0, 0, ?, ?)
-    """, (int(inbound_id), remark, cdn_host, int(port), sni, cdn_host, alpn_json, now_ms, now_ms))
+        ) VALUES (?, 0, ?, '', 0, 0, ?, ?, 'tls', ?, ?, ?, ?, 'chrome', 1, 0, 0, ?, ?)
+    """, (int(inbound_id), remark, cdn_host, int(port), sni, cdn_host, path, alpn_json, now_ms, now_ms))
     con.commit(); con.close(); print("OK"); sys.exit(0)
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
@@ -392,28 +331,7 @@ PYEOF
 }
 
 # strip_tls_py force-rewrites the ACTUAL transport-level Host that
-# Xray-core uses at handshake time (wsSettings.headers.Host /
-# httpupgradeSettings.host / xhttpSettings.host inside stream_settings)
-# to the CDN domain, overwriting any stale panel-domain / blank /
-# manually-set value unconditionally, every time it runs. The cosmetic
-# x-ui "hosts" table alone is not sufficient -- this is the field
-# Xray-core itself reads.
-#
-# uTLS fingerprint ("chrome" impersonation) is set once, in insert_host_py,
-# for ALL three CDN-eligible transports (ws, httpupgrade, xhttp/splithttp)
-# -- that field lives in the x-ui "hosts" table and applies uniformly
-# regardless of transport type.
-#
-# Random packet-size padding (xpaddingBytes) is XHTTP-ONLY below. This is
-# not an arbitrary choice: per Xray-core's own transport schemas,
-# wsSettings and httpupgradeSettings do not define any padding field at
-# all -- only xhttpSettings/splithttpSettings expose "extra.xpaddingBytes".
-# There is nothing to "enable" for ws/httpupgrade because the protocol
-# schema itself has no such option; adding an unrecognized key to those
-# settings blocks would either be silently ignored by Xray-core or, on
-# stricter builds, rejected as invalid config. If a future Xray-core
-# release adds padding support to ws/httpupgrade, extend this function
-# with an "ws"/"httpupgrade" branch mirroring the xhttp one below.
+# Xray-core uses at handshake time to the CDN domain.
 strip_tls_py() {
     python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
 import sqlite3, json, sys
@@ -440,10 +358,39 @@ try:
             xs = ss.setdefault(s_key, {})
             xs["host"] = cdn_host
             extra = xs.setdefault("extra", {})
-            # Random packet-size padding: XHTTP-only, see comment above
-            # this function for why ws/httpupgrade cannot receive this.
             extra["xpaddingBytes"] = "100-1000"
 
+        cur.execute("UPDATE inbounds SET stream_settings=? WHERE id=?", (json.dumps(ss), inb_id))
+        con.commit()
+    con.close(); print("OK"); sys.exit(0)
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
+PYEOF
+}
+
+# set_inbound_path_py (v4.4 NEW): writes a path into the inbound's OWN
+# transport settings (wsSettings.path / httpupgradeSettings.path /
+# xhttpSettings.path / splithttpSettings.path), so Xray-core itself
+# accepts connections on that path -- not just cosmetic metadata.
+# Needed whenever an inbound originally had no path or "/" (which
+# collides with the camouflage "location /" and can never be routed
+# through nginx as-is -- see BUG E below).
+set_inbound_path_py() {
+    python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import sqlite3, json, sys
+try:
+    con = sqlite3.connect(sys.argv[1]); cur = con.cursor()
+    inb_id = int(sys.argv[2]); net = sys.argv[3]; new_path = sys.argv[4]
+    cur.execute("SELECT stream_settings FROM inbounds WHERE id=?", (inb_id,))
+    row = cur.fetchone()
+    if row and row[0]:
+        ss = json.loads(row[0])
+        if net == "ws":
+            ws = ss.setdefault("wsSettings", {}); ws["path"] = new_path
+        elif net == "httpupgrade":
+            hu = ss.setdefault("httpupgradeSettings", {}); hu["path"] = new_path
+        elif net in ("xhttp", "splithttp"):
+            xs = ss.setdefault(net + "Settings", {}); xs["path"] = new_path
         cur.execute("UPDATE inbounds SET stream_settings=? WHERE id=?", (json.dumps(ss), inb_id))
         con.commit()
     con.close(); print("OK"); sys.exit(0)
@@ -532,11 +479,6 @@ check_cert_browser_trust() {
     fi
 }
 
-# Verifies a shared certificate actually covers BOTH domains (SAN list,
-# or CN as fallback for very old certs, including wildcard SAN entries
-# such as *.goldip.me covering both cdn.goldip.me and panel.goldip.me).
-# Fails loudly if it doesn't, rather than letting nginx silently serve a
-# cert that doesn't match one of the two server_names.
 check_cert_covers_domain() {
     local cert="$1" domain="$2" label="$3"
     local san cn
@@ -570,21 +512,31 @@ check_cert_covers_domain() {
 }
 
 # ---------------- Auto Build Locations ----------------
-# End-of-run summary tracks CDN-routed vs non-CDN inbounds explicitly so
-# the user sees exactly what goes through CDN_DOMAIN and what stays
-# direct/panel-only. Only inbounds with network type ws, httpupgrade,
-# xhttp, or splithttp are EVER modified. Every other type (Reality,
-# gRPC, Hysteria2, Trojan, Shadowsocks, etc.) is explicitly skipped.
 CDN_ROUTED_SUMMARY=""
 NONCDN_SUMMARY=""
 HOSTFIX_SUMMARY=""
 
+# *** BUG E (silent inbound drop) ***
+# v4.3 had: `[ -z "$path" ] || [ "$path" = "/" ] && continue` with NO log
+# message at all in that branch. Any ws/httpupgrade/xhttp inbound whose
+# path was empty or "/" (the x-ui default for a freshly created single
+# inbound) was silently thrown away: no location, no DB update, nothing
+# printed -- it simply vanished from CDN routing with zero explanation.
+# For a user with one or two such default inbounds this meant "Auto
+# discovery" reported 0 CDN-compatible inbounds, or quietly skipped the
+# only inbound that mattered.
+# FIX: instead of dropping it, we now auto-generate a unique non-root
+# path, rewrite the location AND (if the user applies DB changes) the
+# inbound's own transport settings via set_inbound_path_py so Xray-core
+# itself accepts connections on that path -- and we tell the user
+# explicitly what happened, since existing client links will need to be
+# re-imported/re-generated after this.
 auto_build_locations() {
     local db=""; for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do [ -f "$c" ] && db="$c" && break; done
     [ -z "$db" ] && return 1
     ok "Reading inbounds from: $db"
 
-    local idx=0 id port ss net path rawpath remark rawremark
+    local idx=0 id port ss net path rawpath remark
     local -a IN_ID IN_PORT IN_NET IN_PATH IN_SS IN_REMARK
     while IFS='|' read -r id port ss remark; do
         [ -n "$port" ] || continue
@@ -598,7 +550,7 @@ auto_build_locations() {
 
     LOCATIONS=""; USED_PORTS=$(ss -ltn 2>/dev/null | grep -oE ':[0-9]+ ' | tr -d ': ' | tr '\n' ' ')
     TAKEN_PORTS=""; local added=0
-    local -a OP_IDS OP_FPORTS OP_NETS OP_PATHS OP_ALPNS
+    local -a OP_IDS OP_FPORTS OP_NETS OP_PATHS OP_ALPNS OP_REMARKS OP_NEWPATH
     local op_count=0 ltype fport
 
     for n in $(seq 1 "$idx"); do
@@ -613,7 +565,17 @@ auto_build_locations() {
                 continue ;;
         esac
 
-        [ -z "$path" ] || [ "$path" = "/" ] && continue
+        local is_new_path=0
+        if [ -z "$path" ] || [ "$path" = "/" ]; then
+            path="$(gen_random_path "$id")"
+            is_new_path=1
+            warn "Inbound \"${remark}\" (#${id}) had no path or used \"/\", which collides with the"
+            warn "camouflage location and can never be routed through nginx. Auto-assigned path"
+            warn "${path} for it -- if you accept DB changes below, the inbound's own transport"
+            warn "settings will be updated to match, and you must re-generate/re-import this"
+            warn "inbound's client subscription link afterward (the old link used no path)."
+        fi
+
         fport="$port"
         if [ "$port" = "$HTTPS_PORT" ] || [ "$port" = "$HTTP_PORT" ]; then fport=$(free_port); fi
         TAKEN_PORTS="${TAKEN_PORTS} ${fport}"
@@ -621,6 +583,7 @@ auto_build_locations() {
         op_count=$((op_count+1))
         OP_IDS[$op_count]="$id"; OP_FPORTS[$op_count]="$fport"; OP_NETS[$op_count]="$net"
         OP_PATHS[$op_count]="$path"; OP_ALPNS[$op_count]=$(alpn_for_net "$net")
+        OP_REMARKS[$op_count]="$remark"; OP_NEWPATH[$op_count]="$is_new_path"
 
         LOCATIONS="${LOCATIONS}"$'\n'"$(make_location "$ltype" "$path" "$fport" "$PRIMARY")"
         echo -e "${CDN_BG} CDN-OK ${RESET} ${net} \"${remark}\" ${path} -> 127.0.0.1:${fport} (Host: ${PRIMARY}, exposed via CDN_DOMAIN:443)"
@@ -629,18 +592,22 @@ auto_build_locations() {
     done
 
     [ "$added" -eq 0 ] && { warn "No CDN-compatible inbounds found."; return 1; }
-    local AP; ask_optional AP "Apply DB changes (fix transport Host headers + rebuild hosts, CDN_DOMAIN=${PRIMARY})?" "[y/N]"
+    local AP; ask_optional AP "Apply DB changes (Host headers + hosts table, CDN=${PRIMARY})?" "[y/N]"
     if is_yes "$AP"; then
         cp "$db" "${db}.bak.$(date +%s)"
         HOSTFIX_SUMMARY=""
         for m in $(seq 1 "$op_count"); do
             mid="${OP_IDS[$m]}"; mfport="${OP_FPORTS[$m]}"; mnet="${OP_NETS[$m]}"; malpn="${OP_ALPNS[$m]}"
+            mpath="${OP_PATHS[$m]}"; mremark="${OP_REMARKS[$m]}"; mnewpath="${OP_NEWPATH[$m]}"
             sqlite3 "$db" "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};"
             strip_tls_py "$db" "$mid" "$mnet" "$PRIMARY" >/dev/null
+            if [ "$mnewpath" = "1" ]; then
+                set_inbound_path_py "$db" "$mid" "$mnet" "$mpath" >/dev/null
+            fi
             sqlite3 "$db" "DELETE FROM hosts WHERE inbound_id=${mid};"
-            insert_host_py "$db" "$mid" "$mnet" "$PRIMARY" "443" "$PRIMARY" "$malpn" >/dev/null
+            insert_host_py "$db" "$mid" "$mremark" "$PRIMARY" "443" "$PRIMARY" "$malpn" "$mpath" >/dev/null
         done
-        ok "Database updated (transport Host headers + hosts table all point to ${PRIMARY})! Restarting x-ui..."
+        ok "Database updated (transport Host headers + path + hosts table all point to ${PRIMARY})! Restarting x-ui..."
         systemctl restart x-ui
 
         echo ""
@@ -650,8 +617,6 @@ auto_build_locations() {
     return 0
 }
 
-# Reads live state back from the DB after writes: transport Host header,
-# hosts.address, and MATCH/MISMATCH verdict against CDN_DOMAIN.
 print_verify_table() {
     local db="$1"
     printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s\n" "ID" "Remark" "Net" "Listen" "Port" "TransportHost" "hosts.address" "Verdict"
@@ -718,27 +683,11 @@ verify_cdn_binding_menu() {
     done < <(verify_cdn_binding_py "$db" "$CDNIN")
     echo ""
     warn "MISMATCH means the inbound's real WebSocket/XHTTP Host header does NOT equal the CDN domain."
-    warn "Run 'Install / Config website' -> Auto discovery again to force-correct any MISMATCH rows."
+    warn "Run 'Install / Config' -> Auto discovery again to force-correct any MISMATCH rows."
 }
 
 # ============================================================
 # Diagnostic for "CDN inbounds stop working after some days".
-# This checks FACTS on the running system against every plausible
-# root cause instead of guessing which one applies to you:
-#   1. Disk space -- unbounded nginx logs (fixed going forward by the
-#      logrotate policy in write_config, but pre-existing huge log
-#      files from before that fix are checked here too).
-#   2. nginx crash/restart history via systemd journal -- tells you
-#      definitively whether nginx itself has been dying.
-#   3. Expired or traffic-exhausted x-ui clients -- an Xray-core-level
-#      cause, entirely unrelated to nginx, that produces the exact
-#      same symptom (inbound "stops working" after N days matches
-#      the client's own expiry/quota, not a routing bug).
-#   4. UFW firewall state for the local ports each CDN inbound
-#      actually listens on -- confirms whether the firewall still
-#      allows traffic to reach nginx's upstream ports.
-#   5. Live listen-state cross-check: are the ports x-ui's DB says
-#      each inbound should be on actually LISTENING right now.
 # ============================================================
 diagnose_delayed_disconnect() {
     echo -e "${INFO}=== 1. Disk space ===${RESET}"
@@ -846,24 +795,26 @@ diagnose_delayed_disconnect() {
     fi
 
     echo ""
+    echo -e "${INFO}=== 7. Exported client link path sanity check (BUG D safeguard) ===${RESET}"
+    if [ -n "$db" ]; then
+        local blank_paths
+        blank_paths=$(sqlite3 "$db" "SELECT COUNT(*) FROM hosts WHERE (path IS NULL OR path='' OR path='/');" 2>/dev/null)
+        if [ -n "$blank_paths" ] && [ "$blank_paths" -gt 0 ]; then
+            err "${blank_paths} row(s) in the hosts table have an empty/root path. Any inbound with such"
+            err "a row will export a client link that cannot reach nginx's specific ws/xhttp location --"
+            err "it will always land on the camouflage block instead. Re-run 'Install / Config' ->"
+            err "Auto discovery and accept DB changes to regenerate these with the correct path."
+        else
+            ok "No hosts rows with an empty/root path found."
+        fi
+    fi
+
+    echo ""
     echo -e "${INFO}=====================================================${RESET}"
     echo -e "${INFO}Summary: sections marked in red above are concrete, verified findings on THIS system --${RESET}"
     echo -e "${INFO}not speculation. Start with any red section; it is the most likely explanation.${RESET}"
 }
 
-
-# BUG B FIX: gzip off, sub_filter_once, sub_filter_types, and every
-# sub_filter directive are now built as a SEPARATE string
-# (CAMO_SUBFILTER_DIRECTIVES) that write_config() places strictly INSIDE
-# "location / { ... }" -- never at server{} scope. Per the official
-# ngx_http_sub_module docs, sub_filter directives set at a given
-# configuration level are inherited by nested levels ONLY IF that nested
-# level defines no sub_filter directives of its own; a directive placed
-# at server{} scope is therefore visible to every sibling location
-# (including ws/xhttp/httpupgrade) unless it defines its own (which they
-# do not). Scoping these strictly inside location / eliminates that
-# inheritance path entirely -- ws/xhttp/httpupgrade locations are never
-# exposed to sub_filter/gzip processing at all.
 _build_camo_block() {
     local js_file="/tmp/goldip_js_$$.js"
     cat > "$js_file" <<JSEOF
@@ -873,10 +824,6 @@ JSEOF
     js_inline=$(sed "s|PROXY_HOST_PH|${PROXY_HOST}|g; s|PROXY_SCHEME_PH|${PROXY_SCHEME}|g" "$js_file" | tr -d '\n')
     rm -f "$js_file"
 
-    # These directives are valid ONLY inside location{} scope in the final
-    # config; they are emitted here as a standalone string and inserted by
-    # write_config() at the correct nesting level (inside location /),
-    # never at server{} scope.
     CAMO_SUBFILTER_DIRECTIVES="        gzip off;
         sub_filter_once off;
         sub_filter_types text/html text/css text/xml text/plain text/javascript application/javascript application/json;
@@ -915,10 +862,6 @@ JSEOF
         proxy_buffers 32 16k;
         proxy_buffer_size 32k;"
 
-    # CAMO_BLOCK is now a SINGLE, correctly-scoped location / block: the
-    # sub_filter/gzip directives and the proxy directives live together
-    # inside the same location, so nothing leaks to sibling locations by
-    # inheritance, and nothing is declared twice.
     CAMO_BLOCK="    location / {
 ${CAMO_PROXY_DIRECTIVES}
 ${CAMO_SUBFILTER_DIRECTIVES}
@@ -1039,9 +982,9 @@ gather_inputs() {
 
     echo -e "${INFO}=== Inbounds ===${RESET}"
     local DISC
-    ask_choice DISC "Inbound discovery mode:" \
-        "1:Auto (read ws/httpupgrade/xhttp inbounds from x-ui DB)" \
-        "2:Manual entry"
+    ask_choice DISC "Discovery mode:" \
+        "1:Auto (DB)" \
+        "2:Manual"
 
     [ "$DISC" = "1" ] && { auto_build_locations || warn "Auto-build failed or skipped. Switching to manual."; }
 
@@ -1055,7 +998,7 @@ gather_inputs() {
             ask_number P_PORT "Local Port"
             local P_TYPE
             ask_choice P_TYPE "Transport:" \
-                "1:WebSocket / HTTPUpgrade" \
+                "1:WS/HTTPUpgrade" \
                 "2:XHTTP"
             case "$P_TYPE" in
                 1) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location upgrade "$P_PATH" "$P_PORT" "$PRIMARY")"
@@ -1076,8 +1019,8 @@ gather_inputs() {
     echo -e "${INFO}=== Camouflage ===${RESET}"
     local CAMO
     ask_choice CAMO "Camouflage type:" \
-        "1:Reverse Proxy (mirror a real website)" \
-        "2:Local HTML (serve your own index.html)"
+        "1:Reverse Proxy" \
+        "2:Local HTML"
     if [ "$CAMO" = "1" ]; then
         ask PROXY_URL "Website to proxy (e.g. example.com)"
         PROXY_HOST=$(strip_scheme "$PROXY_URL"); PROXY_SCHEME="https"
@@ -1099,13 +1042,6 @@ gather_inputs() {
             ask_file HTML_FILE "Path to index.html"
         fi
 
-        # FIX: the old code ran `cp` with no success check and no
-        # existence/size check. A failed cp (permissions, disk full,
-        # unreadable source) left CAMO_ROOT/index.html missing while the
-        # rest of the install kept going, only to fail much later with a
-        # confusing nginx error. Now every step is verified immediately
-        # and any failure stops the install with a clear message instead
-        # of silently continuing.
         if [ ! -f "$HTML_FILE" ]; then
             err "index.html source file not found: ${HTML_FILE}"
             return 1
@@ -1145,25 +1081,6 @@ detect_http2_syntax() {
     fi
 }
 
-# BUG A FIX: write_config() now ALWAYS writes a dedicated HTTPS server
-# block for PANEL_DOMAIN (when it differs from CDN_DOMAIN), reusing the
-# SAME already-validated certificate (guaranteed by
-# check_cert_covers_domain in gather_inputs to cover both names -- for a
-# wildcard cert like *.goldip.me this is automatic). This block proxies
-# ONLY to 127.0.0.1:PANEL_PORT over plain HTTP/1.1 with the real Host
-# preserved via $host (correct here -- this is the actual admin panel
-# app, not an Xray inbound, so it should see whatever Host a legitimate
-# client sends, matching how x-ui/WordPress expect a normal reverse
-# proxy to behave). It carries NO ws/xhttp/httpupgrade locations, so
-# Reality/gRPC/Hysteria2/etc. remain completely unaffected -- they keep
-# listening on their own ports directly, exactly as before.
-#
-# Because BOTH domains now have real server_name blocks with matching
-# certificates, nginx's SNI-based virtual host selection (see
-# ngx_http_ssl_module docs) correctly picks the panel's own certificate
-# and location config for panel traffic instead of ever falling through
-# to the default_server catch-all -- which is the exact mechanism that
-# was returning 444 for panel HTTPS requests before this fix.
 write_config() {
     mkdir -p "$NGINX_CONF_DIR"
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null
@@ -1178,15 +1095,6 @@ write_config() {
 
     detect_http2_syntax
 
-    # default_server catch-all: written to its own dedicated file, once,
-    # shared across all CDN/panel domains configured over time. nginx
-    # allows only ONE default_server per listen address:port; keeping it
-    # in a single shared file guarantees that invariant regardless of how
-    # many domain .conf files exist. Because CDN_DOMAIN and PANEL_DOMAIN
-    # both now get real server_name blocks (this is the actual fix), this
-    # catch-all only ever triggers for genuinely unmatched Host/SNI values
-    # (stale client profiles, IP scanners hitting the raw server IP) --
-    # never for legitimate panel or CDN traffic anymore.
     local catchall_dir="/etc/nginx/goldip-catchall"
     local catchall_conf="${NGINX_CONF_DIR}/00-goldip-catchall.conf"
     if [ ! -f "${catchall_dir}/catchall.pem" ] || [ ! -f "${catchall_dir}/catchall.key" ]; then
@@ -1218,7 +1126,6 @@ write_config() {
         ok "Default-server catch-all written to ${catchall_conf} (rejects unmatched Host/SNI on ${HTTP_PORT}/${HTTPS_PORT})."
     fi
 
-    # ---- CDN_DOMAIN server block (ws/xhttp/httpupgrade + camouflage) ----
     local conf="${NGINX_CONF_DIR}/${PRIMARY}.conf"
     {
         echo "server {"
@@ -1249,12 +1156,6 @@ write_config() {
         echo "}"
     } > "$conf"
 
-    # ---- PANEL_DOMAIN server block (THE FIX for bug A) ----
-    # Dedicated HTTPS vhost for the admin panel only. Reuses the same
-    # certificate (already confirmed to cover this name). Proxies
-    # exclusively to PANEL_PORT. No ws/xhttp/httpupgrade locations here --
-    # Reality/gRPC/Hysteria2/other non-CDN inbounds are untouched and keep
-    # listening on their own ports directly, independent of this block.
     if [ "$PANEL_DOMAIN" != "$CDN_DOMAIN" ]; then
         local panel_conf="${NGINX_CONF_DIR}/${PANEL_DOMAIN}.conf"
         {
@@ -1293,26 +1194,9 @@ write_config() {
             echo "    }"
             echo "}"
         } > "$panel_conf"
-        ok "Panel domain HTTPS block written (${PANEL_DOMAIN}:${HTTPS_PORT}) using the SAME validated certificate -- proxies ONLY to panel port ${PANEL_PORT}. This is the fix for the panel-HTTPS/WordPress-plugin bug."
+        ok "Panel domain HTTPS block written (${PANEL_DOMAIN}:${HTTPS_PORT}) using the SAME validated certificate -- proxies ONLY to panel port ${PANEL_PORT})."
     fi
 
-    # ---- FIX: dedicated logrotate for the per-domain access/error logs ----
-    # write_config() creates a NEW access_log/error_log pair per domain
-    # (${PRIMARY}.access.log, ${PRIMARY}.error.log, ${PANEL_DOMAIN}.access.log,
-    # etc.) but nothing in this script ever registered those exact filenames
-    # with logrotate. Distro-provided /etc/logrotate.d/nginx (from the
-    # nginx-extras package) globs /var/log/nginx/*.log, which DOES already
-    # cover these files on most Debian/Ubuntu installs -- but relying on
-    # that alone is fragile: if that package file is ever missing, replaced,
-    # or the glob pattern differs, these per-domain logs grow completely
-    # unbounded. Unbounded growth over days/weeks eventually exhausts disk
-    # space; when nginx cannot write to its access/error log or open new
-    # log file descriptors, worker processes fail unpredictably (ENOSPC/
-    # crashes), which presents to a user as CDN-routed inbounds "randomly
-    # disconnecting after some days" -- a delayed-onset failure with
-    # exactly this profile. This script now installs an explicit,
-    # self-owned logrotate policy for every log path it itself creates, so
-    # it never depends on the distro's default file being present/correct.
     cat > /etc/logrotate.d/goldip-nginx <<LOGROT_EOF
 /var/log/nginx/*.access.log /var/log/nginx/*.error.log {
     daily
@@ -1327,7 +1211,7 @@ write_config() {
     endscript
 }
 LOGROT_EOF
-    ok "Logrotate policy installed for /var/log/nginx/*.access.log and *.error.log (daily, 14 rotations, USR1 reopen -- prevents unbounded log growth from exhausting disk over time)."
+    ok "Logrotate policy installed for /var/log/nginx/*.access.log and *.error.log (daily, 14 rotations, USR1 reopen)."
 
     if nginx -t; then
         if systemctl restart nginx; then
