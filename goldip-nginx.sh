@@ -1008,6 +1008,22 @@ gather_inputs() {
     ask_port HTTPS_PORT "HTTPS Port" 443
     ask_port HTTP_PORT  "HTTP Port"  80
 
+    # ---- FATAL: panel web port must not collide with the port nginx owns ----
+    # nginx is the thing that listens on HTTPS_PORT (typically 443) and HTTP_PORT
+    # (typically 80). PANEL_PORT is x-ui's OWN internal web port, which nginx
+    # reverse-proxies to on 127.0.0.1. If the user set the x-ui panel to 443,
+    # both nginx and x-ui try to bind 443: one fails to start (so NOTHING loads,
+    # not even the camouflage site), or nginx ends up proxying the panel to
+    # itself (127.0.0.1:443 -> nginx) in an infinite loop. Either way the whole
+    # install looks "successful" but serves nothing. Refuse it up front.
+    if [ "$PANEL_PORT" = "$HTTPS_PORT" ] || [ "$PANEL_PORT" = "$HTTP_PORT" ]; then
+        err "Panel port (${PANEL_PORT}) collides with the port nginx must own (${HTTPS_PORT}/${HTTP_PORT})."
+        err "nginx has to listen on ${HTTPS_PORT} to front your CDN inbounds and camouflage site,"
+        err "so the x-ui panel CANNOT also use ${PANEL_PORT}. In the x-ui panel, set the web"
+        err "'Panel Port' to something internal like 2053 or 8443, then run Install again."
+        exit 1
+    fi
+
     if [ "$PANEL_DOMAIN" = "$CDN_DOMAIN" ]; then
         warn "Panel and CDN domain are IDENTICAL. Non-CDN inbounds (Reality/gRPC/"
         warn "Hysteria2) can't coexist with CDN inbounds on the same Cloudflare-"
@@ -1222,15 +1238,36 @@ write_config() {
         ok "Default-server catch-all written."
     fi
 
-    # ---- CDN_DOMAIN server block (ws/xhttp/httpupgrade + camouflage) ----
+    # ---- CDN_DOMAIN server blocks (ws/xhttp/httpupgrade + camouflage) ----
+    #
+    # CRITICAL ROBUSTNESS FIX: the CDN domain is now served on BOTH the plain
+    # HTTP port and the TLS port, with the SAME locations + camouflage on each.
+    # Previously port 80 did a blind "return 301 https". That silently breaks
+    # the single most common real-world setup for this audience:
+    #   * Cloudflare SSL/TLS mode = "Flexible"  -> Cloudflare connects to the
+    #     origin on PORT 80 (cleartext), never 443. With a 301-to-https on 80,
+    #     Cloudflare gets the redirect, re-requests over its own HTTPS edge,
+    #     hits the origin on 80 again, gets the 301 again... an infinite
+    #     redirect loop. Result: the browser shows NOTHING (ERR_TOO_MANY_
+    #     REDIRECTS) and every ws/httpupgrade inbound fails too -- exactly the
+    #     "even the index.html site doesn't load" symptom.
+    # By serving real content on 80 as well, the setup works under Flexible
+    # (origin hit on 80), Full / Full(strict) (origin hit on 443), AND direct
+    # access -- no dependence on the user's Cloudflare SSL mode.
     local conf="${NGINX_CONF_DIR}/${PRIMARY}.conf"
     {
+        # ---- plain HTTP:80 (Cloudflare Flexible / direct) ----
         echo "server {"
         echo "    listen ${HTTP_PORT};"
         echo "    server_name ${CDN_DOMAIN};"
-        echo "    return 301 https://\$host\$request_uri;"
+        echo "    server_tokens off;"
+        echo "    access_log /var/log/nginx/${PRIMARY}.access.log;"
+        echo "    error_log  /var/log/nginx/${PRIMARY}.error.log;"
+        printf '%s\n' "${LOCATIONS}"
+        echo "${CAMO_BLOCK}"
         echo "}"
         echo ""
+        # ---- TLS:443 (Cloudflare Full / Full-strict / direct) ----
         echo "server {"
         echo "    listen ${HTTPS_PORT} ssl${HTTP2_LISTEN_SUFFIX};"
         [ -n "$HTTP2_DIRECTIVE" ] && echo "$HTTP2_DIRECTIVE"
@@ -1244,7 +1281,6 @@ write_config() {
         echo "    add_header X-Content-Type-Options nosniff always;"
         echo "    add_header X-Frame-Options SAMEORIGIN always;"
         echo "    add_header Referrer-Policy no-referrer-when-downgrade always;"
-        echo "    add_header Strict-Transport-Security \"max-age=63072000; includeSubDomains\" always;"
         echo "    add_header X-XSS-Protection \"0\" always;"
         echo "    access_log /var/log/nginx/${PRIMARY}.access.log;"
         echo "    error_log  /var/log/nginx/${PRIMARY}.error.log;"
@@ -1253,16 +1289,41 @@ write_config() {
         echo "}"
     } > "$conf"
 
-    # ---- PANEL_DOMAIN server block ----
+    # ---- PANEL_DOMAIN server blocks ----
+    # Same both-ports fix as the CDN domain: the panel is reachable whether
+    # Cloudflare hits the origin on 80 (Flexible) or 443 (Full/Full-strict).
+    # The port-80 block proxies to the panel directly instead of 301-looping.
     if [ "$PANEL_DOMAIN" != "$CDN_DOMAIN" ]; then
         local panel_conf="${NGINX_CONF_DIR}/${PANEL_DOMAIN}.conf"
+        local panel_proxy
+        panel_proxy=$(cat <<PANELLOC
+    client_max_body_size 50m;
+    location / {
+        proxy_pass http://127.0.0.1:${PANEL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+PANELLOC
+)
         {
+            # ---- plain HTTP:80 (Cloudflare Flexible / direct) ----
             echo "server {"
             echo "    listen ${HTTP_PORT};"
             echo "    server_name ${PANEL_DOMAIN};"
-            echo "    return 301 https://\$host\$request_uri;"
+            echo "    server_tokens off;"
+            echo "    access_log /var/log/nginx/${PANEL_DOMAIN}.access.log;"
+            echo "    error_log  /var/log/nginx/${PANEL_DOMAIN}.error.log;"
+            printf '%s\n' "${panel_proxy}"
             echo "}"
             echo ""
+            # ---- TLS:443 (Cloudflare Full / Full-strict / direct) ----
             echo "server {"
             echo "    listen ${HTTPS_PORT} ssl${HTTP2_LISTEN_SUFFIX};"
             [ -n "$HTTP2_DIRECTIVE" ] && echo "$HTTP2_DIRECTIVE"
@@ -1277,22 +1338,10 @@ write_config() {
             echo "    add_header X-Frame-Options SAMEORIGIN always;"
             echo "    access_log /var/log/nginx/${PANEL_DOMAIN}.access.log;"
             echo "    error_log  /var/log/nginx/${PANEL_DOMAIN}.error.log;"
-            echo "    client_max_body_size 50m;"
-            echo "    location / {"
-            echo "        proxy_pass http://127.0.0.1:${PANEL_PORT};"
-            echo "        proxy_http_version 1.1;"
-            echo "        proxy_set_header Upgrade \$http_upgrade;"
-            echo "        proxy_set_header Connection \"upgrade\";"
-            echo "        proxy_set_header Host \$host;"
-            echo "        proxy_set_header X-Real-IP \$remote_addr;"
-            echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
-            echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
-            echo "        proxy_read_timeout 300s;"
-            echo "        proxy_send_timeout 300s;"
-            echo "    }"
+            printf '%s\n' "${panel_proxy}"
             echo "}"
         } > "$panel_conf"
-        ok "Panel domain HTTPS block written (${PANEL_DOMAIN}:${HTTPS_PORT} -> 127.0.0.1:${PANEL_PORT})."
+        ok "Panel domain block written (${PANEL_DOMAIN}:${HTTP_PORT}+${HTTPS_PORT} -> 127.0.0.1:${PANEL_PORT})."
     fi
 
     # ---- Dedicated logrotate for per-domain access/error logs ----
