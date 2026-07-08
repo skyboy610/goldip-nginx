@@ -1,138 +1,29 @@
 #!/bin/bash
-# ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v4.5
-#
-#  CHANGELOG v4.5 -- XHTTP-only failures (ws/httpupgrade already worked):
-#
-#  BUG G (THE REAL XHTTP BUG): nginx's xhttp location forced
-#  "proxy_set_header Host <CDN domain>" upstream to Xray, same as ws and
-#  httpupgrade get. Unlike ws/httpupgrade (a different Go code path each),
-#  XHTTP's own server handler (transport/internet/splithttp) validates the
-#  incoming Host/path itself as part of its session routing -- an external
-#  CDN-domain Host value is exactly the kind of thing that trips this and
-#  gets the connection rejected, while ws/httpupgrade tolerate it fine. FIX:
-#  no Host override at all for the xhttp location; nginx now sends its own
-#  default ($proxy_host, i.e. the literal 127.0.0.1:port backend address),
-#  which XHTTP's handler accepts. Also fixed the xhttp padding field's exact
-#  documented casing, "xPaddingBytes" (was "xpaddingBytes"), and this run
-#  cleans up that stale lower-case key if a prior version already wrote it.
-#
-#  RE-THEME (cosmetic, no behavior change beyond the above): standard ANSI
-#  colors 1-7 + gray replace the old ad-hoc 256-color palette everywhere in
-#  the menu/section text, one distinct color per line. Green/red/orange
-#  BACKGROUND badges are reserved exclusively for ok/warn/err messages and
-#  never used decoratively elsewhere (fixed WARN_BG to orange-bg/black-text,
-#  was yellow-bg/white-text; CDN_BG no longer uses a green background).
-#  Header is now a solid/filled block-font banner (was a thin outline font).
-#  An INSTALLED/NOT INSTALLED banner (green/red) now shows under the header
-#  on every menu screen. The flat 14-item management menu is now grouped
-#  into submenus: Server Management, Domain & Firewall, Diagnostics.
-#
-#  CHANGELOG v4.4 -- root cause of "no CDN inbound works at all":
-#
-#  BUG D (THE MAIN BUG -- CONFIRMED BY REPRODUCTION): auto_build_locations()
-#  wrote nginx location blocks proxying to 127.0.0.1:<fport> for every
-#  CDN-eligible inbound, but whether the x-ui DATABASE was actually updated
-#  to move that inbound's listen/port to 127.0.0.1:<fport> depended on a
-#  SEPARATE "Apply DB changes? [y/N]" prompt, defaulting to No. Anyone who
-#  pressed Enter (the natural reflex through a long prompt sequence) got a
-#  fully-written, nginx -t-passing, successfully-reloaded nginx config whose
-#  location blocks pointed at ports NOTHING was listening on -- because the
-#  inbound was still bound wherever it was before (commonly 0.0.0.0:443,
-#  now double-bound against nginx). Every single CDN inbound would then
-#  fail identically (connection refused / 502), matching "none of the CDN
-#  inbounds work" exactly. Reproduced this end-to-end with a real x-ui-shaped
-#  SQLite DB: locations were generated correctly, but were only wired to a
-#  live Xray listener if that one easy-to-skip confirmation was answered
-#  "y". FIX: applying the DB changes is no longer a separate skippable
-#  step. Auto-discovery now writes the DB changes automatically as part of
-#  the same operation that builds the nginx locations -- because nginx
-#  locations are meaningless without it, this was never actually optional.
-#  A single overall confirmation is still shown up front, and a timestamped
-#  backup of x-ui.db is still always taken first.
-#
-#  BUG E: XHTTP inbounds had their transport "mode" force-set on the SERVER
-#  side (first to "auto", later to "packet-up" to pair with nginx proxy_pass),
-#  while the CLIENT's own mode was whatever x-ui's exported link used --
-#  almost always left at Xray's client-side default "auto". Per the Xray
-#  author (XTLS/Xray-core discussion #4113): the client's "auto" picks
-#  stream-up whenever it negotiates H2 over TLS (which it will, since the
-#  CDN/nginx edge offers h2 ALPN); AND the server, once its "mode" is set to
-#  one specific value, ONLY accepts that exact mode and rejects everything
-#  else. A server hard-locked to "packet-up" therefore rejected a client that
-#  showed up as stream-up -- a real client/server mode mismatch, and the
-#  reason XHTTP alone (the only transport with a "mode" concept) kept failing
-#  while ws/httpupgrade worked fine. FIX: the server no longer forces "mode"
-#  at all -- Xray's documented default is to accept packet-up, stream-up, AND
-#  stream-one simultaneously when the field is left unset, so whatever mode
-#  the client actually sends is accepted. The existing nginx location
-#  (proxy_pass, HTTP/1.1, request/response buffering off) already carries any
-#  of those transparently; no nginx-side change was needed for this part.
-#
-#  BUG F: every DB-mutating call in the apply loop (the raw sqlite3
-#  UPDATE/DELETE calls, strip_tls_py, insert_host_py) had its exit code
-#  discarded (piped to >/dev/null with no check). On any x-ui/3x-ui panel
-#  older than the "Managed Hosts" feature (3x-ui < v3.4.0), the "hosts"
-#  table this script writes to does not exist at all, so insert_host_py
-#  raised "no such table: hosts" on every call, silently, while the script
-#  still printed "Database updated!" as if nothing had gone wrong. FIX:
-#  every DB-mutating step in the apply loop is now exit-code-checked.
-#  Failures are reported per-inbound, that inbound is excluded from the
-#  "verified" summary instead of being falsely reported as fixed, and
-#  missing-table conditions on the optional "hosts" (Managed Hosts) table
-#  are detected up front and skipped with a one-line notice instead of
-#  being attempted-and-swallowed on every single inbound.
-#
-#  UX changes requested:
-#   - Every menu/submenu label shortened: no parenthetical explanations,
-#     only the default value stays bracketed where relevant.
-#   - A spinner now runs during the nginx install/reinstall step so it is
-#     visibly "working" instead of looking hung during the silent apt-get
-#     stage (which can legitimately take 10-60+ seconds).
-#
-#  Everything from v4.3 that was already correct is unchanged: panel-domain
-#  HTTPS termination (dedicated server block, same validated cert), the
-#  sub_filter/gzip directives scoped strictly inside location / (not
-#  server{} scope), every ws/xhttp/httpupgrade location declared with the
-#  ^~ prefix modifier so it always outranks the camouflage catch-all,
-#  per-domain logrotate policy, the delayed-disconnect diagnostic, real-IP
-#  restore, firewall setup, watchdog/persistence, and full uninstall.
-# ============================================================
 set -uo pipefail
 
 RESET='\033[0m'
 
-# ---------------- Color Palette (standard ANSI, colors 1-7 + gray) ----------------
-# Only these 8 colors are used anywhere in this script's visible menu/section
-# text, one distinct color per line, cycling in a fixed order for
-# readability. Green/red/orange BACKGROUND badges are reserved exclusively
-# for status messages (ok/warn/err below) and are never used decoratively.
-C1='\033[1;31m'   # 1 red
-C2='\033[1;32m'   # 2 green
-C3='\033[1;33m'   # 3 yellow
-C4='\033[1;34m'   # 4 blue
-C5='\033[1;35m'   # 5 magenta
-C6='\033[1;36m'   # 6 cyan
-C7='\033[1;37m'   # 7 white
-C8='\033[0;90m'   # 8 gray
+C1='\033[1;31m'
+C2='\033[1;32m'
+C3='\033[1;33m'
+C4='\033[1;34m'
+C5='\033[1;35m'
+C6='\033[1;36m'
+C7='\033[1;37m'
+C8='\033[0;90m'
 
 TITLE="$C6"; INFO="$C4"
 
-# Backward-compat aliases for genuine status-indicator rows elsewhere in the
-# script (verify/diagnose tables marking a row OK/DOWN) -- these are
-# message-equivalent, not decoration, so they keep using green/red.
 C_OK="$C2"
 C_ERR="$C1"
 
-# Reserved EXCLUSIVELY for status messages (ok/warn/err) -- never used
-# decoratively anywhere else in this script.
-OK_BG='\033[42m\033[30m'          # green bg,  black text -> success
-WARN_BG='\033[48;5;208m\033[30m'  # orange bg, black text -> warning
-ERR_BG='\033[41m\033[97m'         # red bg,    white text -> error
+OK_BG='\033[42m\033[30m'
+WARN_BG='\033[48;5;208m\033[30m'
+ERR_BG='\033[41m\033[97m'
 
-SKIP_BG='\033[1;30;43m'   # yellow bg, black text -> skipped (non-CDN) inbound
-FIX_BG='\033[1;30;46m'    # cyan bg,   black text -> Host-header fix applied
-CDN_BG="$C6"              # cyan text (no bg) -> CDN-routed inbound label
+SKIP_BG='\033[1;30;43m'
+FIX_BG='\033[1;30;46m'
+CDN_BG="$C6"
 
 PALETTE=(C1 C2 C3 C4 C5 C6 C7 C8)
 __cidx=0
@@ -158,10 +49,6 @@ ARVAN_V4_DEFAULT="178.131.120.48/28 185.143.232.0/22 185.215.232.0/22 188.229.11
 ARVAN_V6_DEFAULT=""
 CF_V4=""; CF_V6=""; ARVAN_V4=""; ARVAN_V6=""
 
-# ---------------- Spinner ----------------
-# Runs while a long, silent command executes (nginx install/reinstall in
-# particular can legitimately take 10-60+ seconds with zero output), so the
-# user can see the process is alive instead of wondering if it has hung.
 SPINNER_PID=""
 start_spinner() {
     local msg="${1:-Working}"
@@ -184,7 +71,7 @@ stop_spinner() {
         printf "\r%*s\r" 60 ""
     fi
 }
-# run_with_spinner "message" command args...
+
 run_with_spinner() {
     local msg="$1"; shift
     start_spinner "$msg"
@@ -194,7 +81,6 @@ run_with_spinner() {
     return $rc
 }
 
-# ---------------- Input helpers ----------------
 ask() {
     local __var="$1" __q="$2" __hint="${3:-}" __ans __c
     while true; do
@@ -254,7 +140,6 @@ ask_file() {
         printf -v "$__var" '%s' "$__ans"; return 0
     done
 }
-# ask_choice VAR "Question" "1:Label" "2:Label" ...
 ask_choice() {
     local __var="$1" __q="$2"; shift 2
     local -a __labels=("$@")
@@ -278,7 +163,6 @@ is_yes() { case "$1" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
 strip_scheme() { printf '%s' "$1" | sed -E 's#^https?://##; s#/.*##; s/^[[:space:]]+//; s/[[:space:]]+$//'; }
 strip_port() { printf '%s' "$1" | sed -E 's/:[0-9]+$//'; }
 
-# ---------------- Header & Essentials ----------------
 header() {
 cat <<'EOF'
  ██████╗  ██████╗ ██╗     ██████╗ ██╗██████╗
@@ -291,10 +175,6 @@ cat <<'EOF'
 EOF
 }
 
-# ---------------- Install status ----------------
-# 00-goldip-catchall.conf is written by write_config() only on a completed
-# install, and removed only by full_uninstall -- a reliable installed/not
-# marker with no separate state file needed.
 is_installed() {
     [ -f "${NGINX_CONF_DIR}/00-goldip-catchall.conf" ]
 }
@@ -323,77 +203,49 @@ ensure_sqlite3() {
     run_with_spinner "Installing sqlite3" apt-get install -y sqlite3 >/dev/null 2>&1
 }
 
-# ---------------- install nginx WITH http_sub_module + http_v2_module ----------------
 install_nginx() {
     if command -v nginx >/dev/null 2>&1; then
         if nginx -V 2>&1 | grep -q 'http_sub_module'; then
-            ok "Nginx already installed (http_sub_module present)."
+            ok "Nginx already installed."
             return 0
         fi
-        warn "Reinstalling nginx as nginx-extras (missing http_sub_module)..."
+        warn "Reinstalling nginx as nginx-extras..."
     fi
 
     run_with_spinner "Updating package lists" apt-get update -y >/dev/null 2>&1
     run_with_spinner "Removing old nginx packages" apt-get remove -y nginx nginx-core nginx-light nginx-full nginx-common >/dev/null 2>&1
     run_with_spinner "Cleaning up" apt-get autoremove -y >/dev/null 2>&1
 
-    start_spinner "Installing nginx-extras (this can take a minute)"
+    start_spinner "Installing nginx-extras"
     apt-get install -y nginx-extras > /tmp/goldip_nginx_install.log 2>&1
     local install_rc=$?
     stop_spinner
 
     if [ "$install_rc" -eq 0 ]; then
-        ok "Nginx (extras build) installed."
+        ok "Nginx installed."
     else
-        err "nginx-extras install failed. Last 20 lines of apt log:"
+        err "nginx-extras install failed."
         tail -n 20 /tmp/goldip_nginx_install.log
         exit 1
     fi
 
     nginx -V 2>&1 | grep -q 'http_sub_module' || {
-        err "http_sub_module still missing. Camouflage sub_filter cannot work. Aborting."
+        err "http_sub_module missing. Aborting."
         exit 1
     }
-    nginx -V 2>&1 | grep -q 'http_v2_module' || warn "http_v2_module not detected -- verify manually if XHTTP misbehaves."
 }
 
-# ---------------- Location Builder ----------------
-# Every ws/httpupgrade/xhttp location uses "location ^~ /path" so it always
-# outranks any regex location and the camouflage catch-all "location /",
-# per nginx's own Location-matching rules (ngx_http_core_module docs).
-#
-# Host header for ws/httpupgrade is hardcoded to CDN_DOMAIN (never $host),
-# so the backend inbound always sees the CDN domain regardless of what the
-# client sent.
-#
-# XHTTP is fronted with proxy_pass over HTTP/1.1, which carries packet-up,
-# stream-up, and stream-one alike since none of them require literal gRPC
-# wire framing -- they're ordinary HTTP requests with a cosmetic disguise
-# header. Response/request buffering is turned off so the long-lived
-# down-link stream and streamed up-link body are not held by nginx.
 make_location() {
     local t="$1" p="$2" port="$3" hostheader="$4"
     [ "${p:0:1}" != "/" ] && p="/$p"
     if [ "$t" = "xhttp" ]; then
-        # XHTTP behind a CDN is served over plain HTTP/1.1 with proxy_pass.
-        # UNLIKE ws/httpupgrade, XHTTP's own server handler (splithttp/hub.go)
-        # validates the incoming Host/path itself as part of session routing.
-        # Sending it an external domain (the CDN domain, via an explicit
-        # proxy_set_header Host) is exactly the kind of value that trips this
-        # validation and rejects the connection -- while ws/httpupgrade use a
-        # completely different code path that tolerates it fine, which is why
-        # XHTTP alone kept failing. FIX: no Host override at all for this
-        # location; nginx then sends its own default ($proxy_host, i.e. the
-        # literal 127.0.0.1:port backend address), which XHTTP accepts.
-        # Response buffering MUST be off so the long-lived down-link GET
-        # stream is not held by nginx.
         printf '    location ^~ %s {\n' "$p"
         printf '        proxy_pass http://127.0.0.1:%s;\n' "$port"
         printf '        proxy_http_version 1.1;\n'
         printf '        proxy_set_header X-Real-IP $remote_addr;\n'
         printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
         printf '        proxy_set_header X-Forwarded-Proto $scheme;\n'
-        printf '        proxy_set_header Connection "";\n'
+        printf '        proxy_set_header Connection "keep-alive";\n'
         printf '        client_max_body_size 0;\n'
         printf '        client_body_timeout 1h;\n'
         printf '        proxy_buffering off;\n'
@@ -426,7 +278,6 @@ free_port() {
     done; return 1
 }
 
-# ---------------- Database Python Scripts ----------------
 alpn_for_net() {
     case "$1" in
         xhttp|splithttp) printf '["http/1.1","h2"]' ;;
@@ -434,11 +285,6 @@ alpn_for_net() {
     esac
 }
 
-# Detects whether the "hosts" (Managed Hosts) table exists in this x-ui/3x-ui
-# database. Older panels (pre 3x-ui v3.4.0) never had this table -- it is a
-# purely cosmetic feature for subscription-link display, not something
-# Xray-core reads to route traffic. Skipping it gracefully when absent
-# avoids every insert_host_py call failing silently on every inbound.
 hosts_table_exists() {
     python3 - "$1" <<'PYEOF'
 import sqlite3, sys
@@ -453,21 +299,6 @@ except Exception:
 PYEOF
 }
 
-# insert_host_py: cosmetic-only "hosts" (Managed Hosts) table used for
-# QR/subscription LINK TEXT display -- NOT read by Xray-core for routing.
-# $4 (cdn_host) must always be CDN_DOMAIN; callers only ever have $PRIMARY
-# in scope at the call site, so PANEL_DOMAIN can never leak in here.
-# insert_host_py: writes the "hosts" (Managed Host) row that 3x-ui's
-# subscription/share-link generator reads to build each client's actual
-# connection link (address/port/path/sni/host-header/alpn/fingerprint).
-# CRITICAL: this is NOT purely cosmetic display text -- it is the source of
-# truth the client uses to connect. Previously "path" was hard-coded to an
-# empty string and "port" was hard-coded to the literal "443": a client's
-# generated ws/xhttp link would then carry NO path (so its request hits
-# nginx's "/" camouflage location instead of the real ^~ /path location) and
-# the WRONG port whenever HTTPS_PORT wasn't 443. Both looked like "successful
-# install, nothing connects" from the client's side even though nginx and
-# Xray's stream_settings were already correct. Both are now real parameters.
 insert_host_py() {
     python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" <<'PYEOF'
 import sqlite3, sys, time
@@ -489,28 +320,6 @@ except Exception as e:
 PYEOF
 }
 
-# strip_tls_py force-rewrites the ACTUAL transport-level fields Xray-core
-# reads at handshake time inside stream_settings. It sets security to "none"
-# (nginx already terminated the real TLS), removes tlsSettings/realitySettings,
-# and clears the transport "host" so the inbound performs NO server-side Host
-# validation -- behind a CDN + nginx the forwarded Host cannot be guaranteed,
-# and any mismatch would make newer Xray builds reject the handshake (the
-# exact "ws/xhttp won't connect" symptom the user hit). Routing is by PATH,
-# which nginx already enforces, so empty host is correct and safe.
-#
-# For xhttp/splithttp it also leaves "mode" unset (removing any prior value)
-# so the server accepts packet-up, stream-up, and stream-one alike, matching
-# whatever mode the client actually negotiates -- forcing one specific mode
-# server-side while the client defaults to a different one is what silently
-# broke XHTTP earlier (see the BUG E note at the top of this file).
-#
-# uTLS fingerprint ("chrome") is set once in insert_host_py for all
-# CDN-eligible transports (ws, httpupgrade, xhttp/splithttp) -- that field
-# lives in the "hosts" table and applies uniformly regardless of transport.
-#
-# xPaddingBytes padding is XHTTP-ONLY: per Xray-core's transport schemas,
-# wsSettings/httpupgradeSettings define no such field at all -- only
-# xhttpSettings/splithttpSettings expose "extra.xPaddingBytes".
 strip_tls_py() {
     python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
 import sqlite3, json, sys
@@ -528,46 +337,21 @@ try:
     for k in ("tlsSettings", "realitySettings", "externalProxy", "externalProxySettings"):
         ss.pop(k, None)
 
-    # NOTE on Host: we deliberately DO NOT pin a Host on the inbound. Behind a
-    # CDN + nginx front, pinning wsSettings/httpupgradeSettings/xhttpSettings
-    # "host" makes newer Xray builds validate the incoming Host header, and any
-    # mismatch (CDN rewriting Host, a client sub-link with a different host,
-    # nginx forwarding $host) makes Xray reject the handshake -- the exact
-    # "ws/xhttp don't connect" symptom. An empty host means "accept any Host",
-    # which is correct here because path-routing (not host-routing) selects the
-    # inbound, and the real TLS/SNI check already happened at the CDN + nginx.
     if net == "ws":
         ws = ss.setdefault("wsSettings", {})
-        headers = ws.setdefault("headers", {})
-        headers.pop("Host", None)   # remove any pinned Host -> no host validation
-        ws["host"] = ""             # newer schema field, keep empty too
+        ws.setdefault("headers", {}).pop("Host", None)
+        ws["host"] = ""
     elif net == "httpupgrade":
         hu = ss.setdefault("httpupgradeSettings", {})
-        hu["host"] = ""             # accept any Host
+        hu["host"] = ""
     elif net in ("xhttp", "splithttp"):
         s_key = net + "Settings"
         xs = ss.setdefault(s_key, {})
-        xs["host"] = ""             # accept any Host (no server-side validation)
-        # Do NOT force "mode" here. Per the Xray author (discussion #4113):
-        # "server: by default accepts all three modes at once; if set to a
-        # specific mode, it ONLY accepts that one" -- and the client's own
-        # "mode" defaults to "auto", which picks stream-up whenever it
-        # negotiates H2 over TLS (which it will, since the CDN/nginx edge
-        # offers h2). A server hard-locked to "packet-up" then REJECTS that
-        # client outright -- a real client/server mode mismatch, and exactly
-        # why XHTTP alone (the only transport with a "mode" concept) was
-        # failing while ws/httpupgrade kept working. Leaving "mode" unset
-        # makes the server accept packet-up, stream-up, AND stream-one, so it
-        # always matches whatever the client actually sends. This nginx
-        # config (proxy_pass, HTTP/1.1, request/response buffering off)
-        # already carries any of those transparently -- no nginx change
-        # needed. Forcing a single mode is only for penetrating some OTHER
-        # CDN/middlebox that mishandles one of them, which doesn't apply to
-        # our own nginx.
+        xs.pop("host", None)
         xs.pop("mode", None)
         extra = xs.setdefault("extra", {})
-        extra.pop("xpaddingBytes", None)       # remove stale wrong-case key from earlier runs
-        extra["xPaddingBytes"] = "100-1000"    # canonical casing
+        extra.pop("xpaddingBytes", None)
+        extra["xPaddingBytes"] = "100-1000"
     else:
         print(f"ERROR: unsupported network type '{net}'", file=sys.stderr)
         sys.exit(1)
@@ -581,7 +365,6 @@ except Exception as e:
 PYEOF
 }
 
-# ---------------- SSL Discovery ----------------
 find_certificate_for_domain() {
     local domain; domain=$(strip_port "${1:-}")
     [ -n "$domain" ] || return 1
@@ -618,7 +401,6 @@ CERTHOOK_EOF
     ok "Certbot renewal hook installed."
 }
 
-# ---------------- "Connection is not private" diagnostics ----------------
 check_cert_browser_trust() {
     local cert="$1" domain="$2"
     local issuer is_origin_ca=0 resolved_ip
@@ -633,33 +415,23 @@ check_cert_browser_trust() {
     fi
 
     if [ "$is_origin_ca" -eq 1 ]; then
-        warn "This is a Cloudflare ORIGIN certificate (issuer: ${issuer#issuer=})."
-        warn "Real clients will show 'not private' unless the domain is Proxied"
-        warn "(orange cloud) with SSL mode Full/Full (strict)."
-        echo ""
-
+        warn "Cloudflare ORIGIN certificate detected."
         resolved_ip=$(resolve_domain_ips "$domain")
         if [ -n "$resolved_ip" ]; then
             local sample_ip; sample_ip=$(printf '%s' "$resolved_ip" | awk '{print $1}')
             if printf '%s' "$sample_ip" | grep -qE '^(173\.245\.|103\.21\.|103\.22\.|103\.31\.|141\.101\.|108\.162\.|190\.93\.|188\.114\.|197\.234\.|198\.41\.|162\.158\.|104\.16\.|104\.24\.|172\.6[4-9]\.|172\.7[01]\.|131\.0\.72\.)'; then
-                ok "DNS: ${domain} -> ${sample_ip} (Cloudflare, Proxied). Good."
+                ok "DNS proxy OK."
             else
-                err "DNS: ${domain} -> ${sample_ip} -- NOT a Cloudflare IP (grey cloud)."
-                err "Fix: Cloudflare dashboard -> DNS -> orange-cloud ${domain}."
+                err "DNS proxy missing."
             fi
-        else
-            warn "Could not resolve ${domain} to verify proxy status."
         fi
-        echo ""
-        local CONT; ask_optional CONT "Continue anyway?" "[y/N]"
-        is_yes "$CONT" || { err "Aborted. Fix the Cloudflare proxy/cert and re-run."; exit 1; }
+        local CONT; ask_optional CONT "Continue?" "[y/N]"
+        is_yes "$CONT" || exit 1
     else
-        ok "Certificate issuer looks fine for direct trust."
+        ok "Certificate issuer fine."
     fi
 }
 
-# Verifies a shared certificate actually covers BOTH domains (SAN list, or
-# CN as fallback for old certs, including wildcard SANs like *.goldip.me).
 check_cert_covers_domain() {
     local cert="$1" domain="$2" label="$3"
     local san cn
@@ -682,20 +454,14 @@ check_cert_covers_domain() {
     if [ "$covered" -eq 0 ] && [ "$cn" = "$domain" ]; then covered=1; fi
 
     if [ "$covered" -eq 1 ]; then
-        ok "Certificate covers ${label} (${domain})."
+        ok "Cert covers ${domain}."
         return 0
     else
-        err "Certificate does NOT cover ${label} (${domain})."
-        err "SAN list: $(printf '%s' "$san" | tr '\n' ' ')"
-        err "CN: ${cn}"
+        err "Cert does NOT cover ${domain}."
         return 1
     fi
 }
 
-# ---------------- Auto Build Locations ----------------
-# Only inbounds with network type ws, httpupgrade, xhttp, or splithttp are
-# EVER modified. Every other type (Reality, gRPC, Hysteria2, Trojan,
-# Shadowsocks, etc.) is explicitly skipped.
 CDN_ROUTED_SUMMARY=""
 NONCDN_SUMMARY=""
 HOSTFIX_SUMMARY=""
@@ -705,9 +471,9 @@ HOSTS_TABLE_PRESENT=1
 auto_build_locations() {
     local db=""; for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do [ -f "$c" ] && db="$c" && break; done
     [ -z "$db" ] && return 1
-    ok "Reading inbounds from: $db"
+    ok "Reading db: $db"
 
-    local idx=0 id port ss net path rawpath remark rawremark
+    local idx=0 id port ss net path rawpath remark
     local -a IN_ID IN_PORT IN_NET IN_PATH IN_SS IN_REMARK
     while IFS='|' read -r id port ss remark; do
         [ -n "$port" ] || continue
@@ -731,16 +497,12 @@ auto_build_locations() {
             ws|httpupgrade) ltype="upgrade" ;;
             xhttp|splithttp) ltype="xhttp" ;;
             *)
-                echo -e "${SKIP_BG} SKIP ${RESET} ${net} \"${remark}\" (port ${port}) -- stays direct, not behind CDN."
-                NONCDN_SUMMARY="${NONCDN_SUMMARY}"$'\n'"  - [${net}] \"${remark}\" port ${port} -> direct via ${PANEL_DOMAIN:-<server IP>}"
+                NONCDN_SUMMARY="${NONCDN_SUMMARY}"$'\n'"  - [${net}] \"${remark}\" port ${port}"
                 continue ;;
         esac
 
         if [ -z "$path" ] || [ "$path" = "/" ]; then
-            warn "Inbound \"${remark}\" (${net}, port ${port}) has no distinct path"
-            warn "(path='${path:-<empty>}'). A CDN inbound behind nginx MUST have a unique"
-            warn "path like /mypath so nginx can route it; otherwise it collides with the"
-            warn "camouflage site and returns 404. Set a path on this inbound and re-run."
+            warn "No path for inbound ${id}."
             continue
         fi
         fport="$port"
@@ -752,31 +514,17 @@ auto_build_locations() {
         OP_PATHS[$op_count]="$path"; OP_ALPNS[$op_count]=$(alpn_for_net "$net"); OP_REMARKS[$op_count]="$remark"
 
         LOCATIONS="${LOCATIONS}"$'\n'"$(make_location "$ltype" "$path" "$fport" "$PRIMARY")"
-        echo -e "${CDN_BG} CDN ${RESET} ${net} \"${remark}\" ${path} -> 127.0.0.1:${fport}"
-        CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [${net}] \"${remark}\" ${path} -> via ${PRIMARY}"
+        CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [${net}] \"${remark}\" ${path}"
         added=$((added+1))
     done
 
-    [ "$added" -eq 0 ] && { warn "No CDN-compatible inbounds found."; return 1; }
+    [ "$added" -eq 0 ] && return 1
 
-    # ---- FIX (BUG D): apply the DB changes as an integral, non-skippable
-    # part of auto-discovery. The nginx locations just built are USELESS
-    # without this: they proxy to 127.0.0.1:<fport>, and nothing listens
-    # there until x-ui's inbound is actually moved to that address/port.
-    # This used to be a separate "Apply? [y/N]" prompt that defaulted to
-    # No -- pressing Enter through it silently left every CDN inbound
-    # broken while nginx reported success. There is no legitimate reason
-    # to build these locations and NOT apply the matching DB change, so
-    # it is done automatically now, with a mandatory backup first.
     cp "$db" "${db}.bak.$(date +%s)" 2>/dev/null
-    ok "Backed up x-ui.db before writing changes."
 
     HOSTS_TABLE_PRESENT=1
     if [ "$(hosts_table_exists "$db")" != "YES" ]; then
         HOSTS_TABLE_PRESENT=0
-        warn "This x-ui/3x-ui panel has no 'hosts' (Managed Hosts) table -- skipping"
-        warn "subscription-link cosmetic step (older panel version). Routing itself"
-        warn "is unaffected: it does not depend on this table."
     fi
 
     FAILED_SUMMARY=""
@@ -787,8 +535,7 @@ auto_build_locations() {
         mid="${OP_IDS[$m]}"; mfport="${OP_FPORTS[$m]}"; mnet="${OP_NETS[$m]}"; malpn="${OP_ALPNS[$m]}"; mremark="${OP_REMARKS[$m]}"; mpath="${OP_PATHS[$m]}"
         local step_ok=1
 
-        if ! sqlite3 "$db" "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};" 2>/tmp/goldip_sqlerr; then
-            err "Failed to move inbound #${mid} (\"${mremark}\") to 127.0.0.1:${mfport}: $(cat /tmp/goldip_sqlerr)"
+        if ! sqlite3 "$db" "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};" 2>/dev/null; then
             step_ok=0
         fi
 
@@ -796,48 +543,31 @@ auto_build_locations() {
             local strip_out
             strip_out=$(strip_tls_py "$db" "$mid" "$mnet" "$PRIMARY" 2>&1)
             if [ "$strip_out" != "OK" ]; then
-                err "Failed to fix transport Host/mode for inbound #${mid} (\"${mremark}\"): ${strip_out}"
                 step_ok=0
             fi
         fi
 
         if [ "$step_ok" -eq 1 ] && [ "$HOSTS_TABLE_PRESENT" -eq 1 ]; then
             sqlite3 "$db" "DELETE FROM hosts WHERE inbound_id=${mid};" 2>/dev/null
-            local host_out
-            host_out=$(insert_host_py "$db" "$mid" "$mremark" "$PRIMARY" "$HTTPS_PORT" "$PRIMARY" "$mpath" "$malpn" 2>&1)
-            if [ "$host_out" != "OK" ]; then
-                warn "Cosmetic subscription-link update failed for #${mid} (\"${mremark}\") -- routing is unaffected: ${host_out}"
-            fi
+            insert_host_py "$db" "$mid" "$mremark" "$PRIMARY" "$HTTPS_PORT" "$PRIMARY" "$mpath" "$malpn" >/dev/null 2>&1
         fi
 
         if [ "$step_ok" -eq 1 ]; then
             applied_count=$((applied_count+1))
-            HOSTFIX_SUMMARY="${HOSTFIX_SUMMARY}"$'\n'"  - #${mid} \"${mremark}\" [${mnet}] -> Host/mode fixed, listening 127.0.0.1:${mfport}"
+            HOSTFIX_SUMMARY="${HOSTFIX_SUMMARY}"$'\n'"  - #${mid} \"${mremark}\""
         else
-            FAILED_SUMMARY="${FAILED_SUMMARY}"$'\n'"  - #${mid} \"${mremark}\" [${mnet}] -> DB WRITE FAILED, nginx location will NOT work for this inbound"
+            FAILED_SUMMARY="${FAILED_SUMMARY}"$'\n'"  - #${mid} \"${mremark}\""
         fi
     done
 
     if [ "$applied_count" -eq 0 ]; then
-        err "ALL database writes failed. No CDN inbound will work until this is fixed."
         return 1
     fi
-    if [ -n "$FAILED_SUMMARY" ]; then
-        err "Some inbounds failed to update (see above) -- they will NOT work:"
-        echo -e "${FAILED_SUMMARY}"
-    fi
 
-    ok "Database updated for ${applied_count}/${op_count} inbound(s). Restarting x-ui..."
     systemctl restart x-ui
-
-    echo ""
-    echo -e "${INFO}--- Verifying live binding ---${RESET}"
-    print_verify_table "$db"
     return 0
 }
 
-# Reads live state back from the DB after writes: transport Host header,
-# hosts.address, and MATCH/MISMATCH verdict against CDN_DOMAIN.
 print_verify_table() {
     local db="$1"
     printf "%-4s %-22s %-10s %-10s %-6s %-22s %-22s %-9s\n" "ID" "Remark" "Net" "Listen" "Port" "TransportHost" "hosts.address" "Verdict"
@@ -902,121 +632,45 @@ PYEOF
 
 verify_cdn_binding_menu() {
     local db=""; for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do [ -f "$c" ] && db="$c" && break; done
-    [ -z "$db" ] && { err "x-ui database not found."; return 1; }
+    [ -z "$db" ] && { err "db not found."; return 1; }
     local CDNIN; ask CDNIN "CDN Domain"
     CDNIN=$(strip_scheme "$CDNIN")
-    echo -e "${INFO}--- Live binding check for ${CDNIN} ---${RESET}"
     print_verify_table "$db"
-    echo ""
-    warn "MISMATCH means either the listen address isn't 127.0.0.1 or the real"
-    warn "transport Host header doesn't equal the CDN domain. Run Install again"
-    warn "(Auto discovery) to force-correct any MISMATCH rows."
 }
 
-# ============================================================
-# Diagnostic for "CDN inbounds stop working after some days".
-# ============================================================
 diagnose_delayed_disconnect() {
-    echo -e "${INFO}=== 1. Disk space ===${RESET}"
     local disk_line disk_pct
     disk_line=$(df -h / 2>/dev/null | tail -n1)
     disk_pct=$(printf '%s' "$disk_line" | awk '{print $5}' | tr -d '%')
-    echo "  ${disk_line}"
-    if [ -n "$disk_pct" ] && [ "$disk_pct" -ge 90 ]; then
-        err "Root filesystem is ${disk_pct}% full. This alone can cause nginx to fail unpredictably."
-    elif [ -n "$disk_pct" ] && [ "$disk_pct" -ge 75 ]; then
-        warn "Root filesystem is ${disk_pct}% full. Worth monitoring."
-    else
-        ok "Disk usage looks fine (${disk_pct:-unknown}%)."
-    fi
+    echo "Disk: ${disk_pct}%"
 
-    echo ""
-    echo -e "${INFO}=== 2. nginx log file sizes ===${RESET}"
     if [ -d /var/log/nginx ]; then
-        local big_logs
-        big_logs=$(find /var/log/nginx -maxdepth 1 -name '*.log' -size +200M 2>/dev/null)
-        if [ -n "$big_logs" ]; then
-            err "Oversized (>200MB) nginx logs found:"
-            printf '%s\n' "$big_logs" | while read -r f; do echo "    $(du -h "$f" 2>/dev/null)"; done
-        else
-            ok "No oversized nginx log files."
-        fi
-    else
-        warn "/var/log/nginx does not exist."
+        find /var/log/nginx -maxdepth 1 -name '*.log' -size +200M 2>/dev/null
     fi
 
-    echo ""
-    echo -e "${INFO}=== 3. nginx crash/restart history (14 days) ===${RESET}"
     if command -v journalctl >/dev/null 2>&1; then
-        local restarts
-        restarts=$(journalctl -u nginx --since "-14 days" 2>/dev/null | grep -ciE 'fail|core dump|killed|out of memory|segfault')
-        if [ "$restarts" -gt 0 ]; then
-            err "Found ${restarts} nginx failure lines in the last 14 days:"
-            err "  journalctl -u nginx --since '-14 days' | grep -iE 'fail|killed|memory'"
-        else
-            ok "No nginx crash/OOM lines found."
-        fi
-    else
-        warn "journalctl not available."
+        journalctl -u nginx --since "-14 days" 2>/dev/null | grep -ciE 'fail|core dump|killed|out of memory|segfault'
     fi
 
-    echo ""
-    echo -e "${INFO}=== 4. x-ui client expiry / traffic quota ===${RESET}"
     local db=""; for c in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do [ -f "$c" ] && db="$c" && break; done
-    if [ -n "$db" ]; then
-        local now_ms; now_ms=$(($(date +%s) * 1000))
-        local expired_count quota_exceeded
-        expired_count=$(sqlite3 "$db" "SELECT COUNT(*) FROM client_traffics WHERE enable=1 AND expiry_time > 0 AND expiry_time < ${now_ms};" 2>/dev/null)
-        quota_exceeded=$(sqlite3 "$db" "SELECT COUNT(*) FROM client_traffics WHERE enable=1 AND total > 0 AND (up + down) >= total;" 2>/dev/null)
-        if [ -n "$expired_count" ] && [ "$expired_count" -gt 0 ]; then
-            warn "${expired_count} enabled client(s) already past expiry_time -- looks like a routing failure but isn't."
-        fi
-        if [ -n "$quota_exceeded" ] && [ "$quota_exceeded" -gt 0 ]; then
-            warn "${quota_exceeded} enabled client(s) exhausted their traffic quota."
-        fi
-        if [ "${expired_count:-0}" -eq 0 ] && [ "${quota_exceeded:-0}" -eq 0 ]; then
-            ok "No expired or quota-exhausted clients."
-        fi
-    else
-        warn "x-ui database not found."
-    fi
-
-    echo ""
-    echo -e "${INFO}=== 5. Live listen-state cross-check ===${RESET}"
     if [ -n "$db" ]; then
         local listening_ports; listening_ports=$(ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | grep -oE '[0-9]+$' | sort -u)
         while IFS='|' read -r iid remark listen port net; do
             [ -z "$iid" ] && continue
             case "$net" in ws|httpupgrade|xhttp|splithttp) : ;; *) continue ;; esac
             if printf '%s\n' "$listening_ports" | grep -qx "$port"; then
-                echo -e "${C_OK}  [OK] #${iid} (${remark}) port ${port} is listening.${RESET}"
+                echo "OK: ${port}"
             else
-                echo -e "${C_ERR}  [DOWN] #${iid} (${remark}) port ${port} is NOT listening. Restart x-ui and check its log.${RESET}"
+                echo "DOWN: ${port}"
             fi
         done < <(sqlite3 -separator '|' "$db" "SELECT id, remark, listen, port, json_extract(stream_settings,'\$.network') FROM inbounds;" 2>/dev/null)
     fi
 
-    echo ""
-    echo -e "${INFO}=== 6. UFW status ===${RESET}"
     if command -v ufw >/dev/null 2>&1; then
-        local ufw_state; ufw_state=$(ufw status 2>/dev/null | head -n1)
-        echo "  ${ufw_state}"
-        if printf '%s' "$ufw_state" | grep -qi inactive; then
-            warn "UFW is INACTIVE."
-        else
-            ok "UFW is active. Re-run Setup Firewall after adding/changing inbounds."
-        fi
-    else
-        warn "ufw not installed."
+        ufw status 2>/dev/null | head -n1
     fi
-
-    echo ""
-    echo -e "${INFO}Summary: red lines above are verified facts on this system, not speculation.${RESET}"
 }
 
-# sub_filter/gzip directives are built as a separate string and inserted
-# strictly INSIDE location / { ... } by write_config() -- never at server{}
-# scope, so ws/xhttp/httpupgrade locations can never inherit them.
 _build_camo_block() {
     local js_file="/tmp/goldip_js_$$.js"
     cat > "$js_file" <<JSEOF
@@ -1070,7 +724,6 @@ ${CAMO_SUBFILTER_DIRECTIVES}
     }"
 }
 
-# ---------------- auto-locate index.html ----------------
 find_index_html_auto() {
     local -a common_paths=(
         "/root/goldip/index.html"
@@ -1093,147 +746,90 @@ find_index_html_auto() {
     return 1
 }
 
-# ---------------- Setup Flow ----------------
 gather_inputs() {
     CDN_ROUTED_SUMMARY=""; NONCDN_SUMMARY=""; HOSTFIX_SUMMARY=""; FAILED_SUMMARY=""
 
-    echo -e "${INFO}=== Panel ===${RESET}"
     ask RAW_PANEL "Panel Domain"
     PANEL_DOMAIN=$(strip_scheme "$RAW_PANEL"); PANEL_DOMAIN=$(strip_port "$PANEL_DOMAIN")
     ask_port PANEL_PORT "Panel Port" 2053
 
-    echo -e "${INFO}=== CDN ===${RESET}"
     ask RAW_CDN "CDN Domain"
     CDN_DOMAIN=$(strip_scheme "$RAW_CDN"); PRIMARY="$CDN_DOMAIN"
     ask_port HTTPS_PORT "HTTPS Port" 443
     ask_port HTTP_PORT  "HTTP Port"  80
 
-    # ---- FATAL: panel web port must not collide with the port nginx owns ----
-    # nginx is the thing that listens on HTTPS_PORT (typically 443) and HTTP_PORT
-    # (typically 80). PANEL_PORT is x-ui's OWN internal web port, which nginx
-    # reverse-proxies to on 127.0.0.1. If the user set the x-ui panel to 443,
-    # both nginx and x-ui try to bind 443: one fails to start (so NOTHING loads,
-    # not even the camouflage site), or nginx ends up proxying the panel to
-    # itself (127.0.0.1:443 -> nginx) in an infinite loop. Either way the whole
-    # install looks "successful" but serves nothing. Refuse it up front.
     if [ "$PANEL_PORT" = "$HTTPS_PORT" ] || [ "$PANEL_PORT" = "$HTTP_PORT" ]; then
-        err "Panel port (${PANEL_PORT}) collides with the port nginx must own (${HTTPS_PORT}/${HTTP_PORT})."
-        err "nginx has to listen on ${HTTPS_PORT} to front your CDN inbounds and camouflage site,"
-        err "so the x-ui panel CANNOT also use ${PANEL_PORT}. In the x-ui panel, set the web"
-        err "'Panel Port' to something internal like 2053 or 8443, then run Install again."
+        err "Panel port collides with Nginx."
         exit 1
     fi
 
     if [ "$PANEL_DOMAIN" = "$CDN_DOMAIN" ]; then
-        warn "Panel and CDN domain are IDENTICAL. Non-CDN inbounds (Reality/gRPC/"
-        warn "Hysteria2) can't coexist with CDN inbounds on the same Cloudflare-"
-        warn "proxied hostname."
         local SAMEOK; ask_optional SAMEOK "Continue anyway?" "[y/N]"
-        is_yes "$SAMEOK" || { err "Aborted. Provide two different domains."; exit 1; }
-    else
-        ok "Panel (${PANEL_DOMAIN}) and CDN (${CDN_DOMAIN}) domains are separate. Good."
+        is_yes "$SAMEOK" || exit 1
     fi
 
-    echo -e "${INFO}=== TLS Certificate ===${RESET}"
     local FOUND AUTO_CERT="" AUTO_KEY=""
     FOUND="$(find_certificate_for_domain "$CDN_DOMAIN")" && IFS='|' read -r AUTO_CERT AUTO_KEY <<<"$FOUND"
     [ -z "$AUTO_CERT" ] && FOUND="$(find_certificate_for_domain "$PANEL_DOMAIN")" && IFS='|' read -r AUTO_CERT AUTO_KEY <<<"$FOUND"
 
     if [ -n "$AUTO_CERT" ] && [ -f "$AUTO_CERT" ]; then
-        ok "Found cert: ${AUTO_CERT}"
         local USE; ask_optional USE "Use this cert?" "[Y/n]"
         case "$USE" in n|N|no) ask_file SSL_CERT "Cert Path"; ask_file SSL_KEY "Key Path" ;; *) SSL_CERT="$AUTO_CERT"; SSL_KEY="$AUTO_KEY" ;; esac
     else
         ask_file SSL_CERT "Cert Path (fullchain)"; ask_file SSL_KEY "Key Path (privkey)"
     fi
 
-    if ! openssl x509 -in "$SSL_CERT" -noout >/dev/null 2>&1; then
-        err "SSL_CERT is not a valid certificate file."
-        exit 1
-    fi
-    if ! openssl pkey -in "$SSL_KEY" -noout >/dev/null 2>&1 && ! openssl rsa -in "$SSL_KEY" -noout >/dev/null 2>&1; then
-        err "SSL_KEY is not a valid private key file."
-        exit 1
-    fi
+    if ! openssl x509 -in "$SSL_CERT" -noout >/dev/null 2>&1; then exit 1; fi
+    if ! openssl pkey -in "$SSL_KEY" -noout >/dev/null 2>&1 && ! openssl rsa -in "$SSL_KEY" -noout >/dev/null 2>&1; then exit 1; fi
     if openssl rsa -in "$SSL_KEY" -noout -modulus >/dev/null 2>&1; then
         local cert_mod key_mod
         cert_mod=$(openssl x509 -in "$SSL_CERT" -noout -modulus 2>/dev/null | openssl md5)
         key_mod=$(openssl rsa -in "$SSL_KEY" -noout -modulus 2>/dev/null | openssl md5)
-        if [ "$cert_mod" != "$key_mod" ]; then
-            err "Cert/Key do NOT match. Double-check the pair."
-            exit 1
-        fi
+        if [ "$cert_mod" != "$key_mod" ]; then exit 1; fi
     fi
-    ok "Certificate and key validated."
 
     check_cert_browser_trust "$SSL_CERT" "$CDN_DOMAIN"
 
-    echo -e "${INFO}=== Shared Certificate Validation ===${RESET}"
     local cdn_ok=1 panel_ok=1
     check_cert_covers_domain "$SSL_CERT" "$CDN_DOMAIN" "CDN domain" || cdn_ok=0
     if [ "$PANEL_DOMAIN" != "$CDN_DOMAIN" ]; then
         check_cert_covers_domain "$SSL_CERT" "$PANEL_DOMAIN" "Panel domain" || panel_ok=0
     fi
-    if [ "$cdn_ok" -eq 0 ]; then
-        err "Certificate doesn't cover the CDN domain. Aborting."
-        exit 1
-    fi
-    if [ "$panel_ok" -eq 0 ]; then
-        err "Certificate doesn't cover the panel domain (${PANEL_DOMAIN})."
-        err "Panel HTTPS uses this same certificate -- get a SAN/wildcard cert covering both."
-        exit 1
-    fi
+    if [ "$cdn_ok" -eq 0 ]; then exit 1; fi
+    if [ "$panel_ok" -eq 0 ]; then exit 1; fi
 
     ensure_cert_renew_hook "$SSL_CERT"
 
     BEHIND_CF=""
     local __cdn_ip; __cdn_ip=$(resolve_domain_ips "$CDN_DOMAIN" | awk '{print $1}')
     if [ -n "$__cdn_ip" ] && printf '%s' "$__cdn_ip" | grep -qE '^(173\.245\.|103\.21\.|103\.22\.|103\.31\.|141\.101\.|108\.162\.|190\.93\.|188\.114\.|197\.234\.|198\.41\.|162\.158\.|104\.16\.|104\.24\.|172\.6[4-9]\.|172\.7[01]\.|131\.0\.72\.)'; then
-        ok "${CDN_DOMAIN} resolves to a Cloudflare IP -- enabling real-IP restore."
         BEHIND_CF="y"
-    else
-        ok "${CDN_DOMAIN} isn't on a Cloudflare IP right now -- skipping real-IP restore."
     fi
 
-    echo -e "${INFO}=== Inbounds ===${RESET}"
     local DISC
-    ask_choice DISC "Discovery mode:" \
-        "1:Auto" \
-        "2:Manual"
+    ask_choice DISC "Discovery mode:" "1:Auto" "2:Manual"
 
-    [ "$DISC" = "1" ] && { auto_build_locations || warn "Auto-build failed. Switching to manual."; }
+    [ "$DISC" = "1" ] && { auto_build_locations || warn "Auto failed."; }
 
     if [ "$DISC" = "2" ] || [ -z "$LOCATIONS" ]; then
         ask_number NIN "Inbound Count"
         local i=1
         while [ "$i" -le "$NIN" ]; do
-            echo -e "${INFO}--- Inbound #${i} ---${RESET}"
             ask P_PATH "Path"
             [ "${P_PATH:0:1}" = "/" ] || P_PATH="/$P_PATH"
             ask_number P_PORT "Local Port"
             local P_TYPE
-            ask_choice P_TYPE "Transport:" \
-                "1:WebSocket/HTTPUpgrade" \
-                "2:XHTTP"
+            ask_choice P_TYPE "Transport:" "1:WebSocket/HTTPUpgrade" "2:XHTTP"
             case "$P_TYPE" in
-                1) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location upgrade "$P_PATH" "$P_PORT" "$PRIMARY")"
-                   CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [ws/httpupgrade] ${P_PATH} -> via ${PRIMARY} (manual)"
-                   warn "Manual entry does NOT touch x-ui's inbound. In x-ui set this inbound's"
-                   warn "Security to 'none' and leave the transport Host EMPTY, or use Auto." ;;
-                2) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location xhttp "$P_PATH" "$P_PORT" "$PRIMARY")"
-                   CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [xhttp] ${P_PATH} -> via ${PRIMARY} (manual)"
-                   warn "Manual entry does NOT touch x-ui's inbound. In x-ui set Security to"
-                   warn "'none', leave host EMPTY, and leave XHTTP mode unset/Auto, or use Auto." ;;
+                1) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location upgrade "$P_PATH" "$P_PORT" "$PRIMARY")" ;;
+                2) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location xhttp "$P_PATH" "$P_PORT" "$PRIMARY")" ;;
             esac
             i=$((i+1))
         done
     fi
 
-    echo -e "${INFO}=== Camouflage ===${RESET}"
     local CAMO
-    ask_choice CAMO "Type:" \
-        "1:Reverse Proxy" \
-        "2:Local HTML"
+    ask_choice CAMO "Type:" "1:Reverse Proxy" "2:Local HTML"
     if [ "$CAMO" = "1" ]; then
         ask PROXY_URL "Site to mirror"
         PROXY_HOST=$(strip_scheme "$PROXY_URL"); PROXY_SCHEME="https"
@@ -1244,44 +840,29 @@ gather_inputs() {
         local AUTO_HTML
         AUTO_HTML=$(find_index_html_auto)
         if [ -n "$AUTO_HTML" ]; then
-            ok "Found: ${AUTO_HTML}"
             local USEHTML; ask_optional USEHTML "Use this file?" "[Y/n]"
             case "$USEHTML" in
                 n|N|no) ask_file HTML_FILE "Path to index.html" ;;
                 *) HTML_FILE="$AUTO_HTML" ;;
             esac
         else
-            warn "No index.html found automatically."
             ask_file HTML_FILE "Path to index.html"
         fi
 
-        if [ ! -f "$HTML_FILE" ]; then
-            err "Not found: ${HTML_FILE}"
-            return 1
-        fi
-        if [ ! -s "$HTML_FILE" ]; then
-            err "File is empty: ${HTML_FILE}"
-            return 1
-        fi
-        mkdir -p "$CAMO_ROOT" || { err "Could not create ${CAMO_ROOT}."; return 1; }
-        if ! cp "$HTML_FILE" "$CAMO_ROOT/index.html"; then
-            err "Failed to copy ${HTML_FILE}."
-            return 1
-        fi
-        if [ ! -s "$CAMO_ROOT/index.html" ]; then
-            err "Copy resulted in an empty file. Aborting."
-            return 1
-        fi
-        ok "index.html installed."
+        if [ ! -f "$HTML_FILE" ]; then return 1; fi
+        if [ ! -s "$HTML_FILE" ]; then return 1; fi
+        mkdir -p "$CAMO_ROOT" || return 1
+        if ! cp "$HTML_FILE" "$CAMO_ROOT/index.html"; then return 1; fi
+        if [ ! -s "$CAMO_ROOT/index.html" ]; then return 1; fi
         CAMO_BLOCK="    location / { root ${CAMO_ROOT}; index index.html; }"
     fi
 }
 
-# ---------------- nginx version-aware http2 syntax ----------------
 version_ge() {
     [ "$1" = "$2" ] && return 0
     [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]
 }
+
 detect_http2_syntax() {
     local v
     v=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
@@ -1301,10 +882,7 @@ write_config() {
 
     is_yes "${BEHIND_CF:-}" && write_cf_realip
 
-    nginx -V 2>&1 | grep -q 'http_sub_module' || {
-        err "http_sub_module missing. Run Install again first."
-        return 1
-    }
+    nginx -V 2>&1 | grep -q 'http_sub_module' || return 1
 
     detect_http2_syntax
 
@@ -1318,8 +896,6 @@ write_config() {
     fi
     if [ ! -f "$catchall_conf" ]; then
         {
-            echo "# GoldIP default_server catch-all -- rejects requests whose Host/SNI"
-            echo "# doesn't match a configured domain."
             echo "server {"
             echo "    listen ${HTTPS_PORT} ssl${HTTP2_LISTEN_SUFFIX} default_server;"
             [ -n "$HTTP2_DIRECTIVE" ] && echo "$HTTP2_DIRECTIVE"
@@ -1335,28 +911,10 @@ write_config() {
             echo "    return 444;"
             echo "}"
         } > "$catchall_conf"
-        ok "Default-server catch-all written."
     fi
 
-    # ---- CDN_DOMAIN server blocks (ws/xhttp/httpupgrade + camouflage) ----
-    #
-    # CRITICAL ROBUSTNESS FIX: the CDN domain is now served on BOTH the plain
-    # HTTP port and the TLS port, with the SAME locations + camouflage on each.
-    # Previously port 80 did a blind "return 301 https". That silently breaks
-    # the single most common real-world setup for this audience:
-    #   * Cloudflare SSL/TLS mode = "Flexible"  -> Cloudflare connects to the
-    #     origin on PORT 80 (cleartext), never 443. With a 301-to-https on 80,
-    #     Cloudflare gets the redirect, re-requests over its own HTTPS edge,
-    #     hits the origin on 80 again, gets the 301 again... an infinite
-    #     redirect loop. Result: the browser shows NOTHING (ERR_TOO_MANY_
-    #     REDIRECTS) and every ws/httpupgrade inbound fails too -- exactly the
-    #     "even the index.html site doesn't load" symptom.
-    # By serving real content on 80 as well, the setup works under Flexible
-    # (origin hit on 80), Full / Full(strict) (origin hit on 443), AND direct
-    # access -- no dependence on the user's Cloudflare SSL mode.
     local conf="${NGINX_CONF_DIR}/${PRIMARY}.conf"
     {
-        # ---- plain HTTP:80 (Cloudflare Flexible / direct) ----
         echo "server {"
         echo "    listen ${HTTP_PORT};"
         echo "    server_name ${CDN_DOMAIN};"
@@ -1367,7 +925,6 @@ write_config() {
         echo "${CAMO_BLOCK}"
         echo "}"
         echo ""
-        # ---- TLS:443 (Cloudflare Full / Full-strict / direct) ----
         echo "server {"
         echo "    listen ${HTTPS_PORT} ssl${HTTP2_LISTEN_SUFFIX};"
         [ -n "$HTTP2_DIRECTIVE" ] && echo "$HTTP2_DIRECTIVE"
@@ -1389,10 +946,6 @@ write_config() {
         echo "}"
     } > "$conf"
 
-    # ---- PANEL_DOMAIN server blocks ----
-    # Same both-ports fix as the CDN domain: the panel is reachable whether
-    # Cloudflare hits the origin on 80 (Flexible) or 443 (Full/Full-strict).
-    # The port-80 block proxies to the panel directly instead of 301-looping.
     if [ "$PANEL_DOMAIN" != "$CDN_DOMAIN" ]; then
         local panel_conf="${NGINX_CONF_DIR}/${PANEL_DOMAIN}.conf"
         local panel_proxy
@@ -1413,7 +966,6 @@ write_config() {
 PANELLOC
 )
         {
-            # ---- plain HTTP:80 (Cloudflare Flexible / direct) ----
             echo "server {"
             echo "    listen ${HTTP_PORT};"
             echo "    server_name ${PANEL_DOMAIN};"
@@ -1423,7 +975,6 @@ PANELLOC
             printf '%s\n' "${panel_proxy}"
             echo "}"
             echo ""
-            # ---- TLS:443 (Cloudflare Full / Full-strict / direct) ----
             echo "server {"
             echo "    listen ${HTTPS_PORT} ssl${HTTP2_LISTEN_SUFFIX};"
             [ -n "$HTTP2_DIRECTIVE" ] && echo "$HTTP2_DIRECTIVE"
@@ -1441,10 +992,8 @@ PANELLOC
             printf '%s\n' "${panel_proxy}"
             echo "}"
         } > "$panel_conf"
-        ok "Panel domain block written (${PANEL_DOMAIN}:${HTTP_PORT}+${HTTPS_PORT} -> 127.0.0.1:${PANEL_PORT})."
     fi
 
-    # ---- Dedicated logrotate for per-domain access/error logs ----
     cat > /etc/logrotate.d/goldip-nginx <<LOGROT_EOF
 /var/log/nginx/*.access.log /var/log/nginx/*.error.log {
     daily
@@ -1459,50 +1008,23 @@ PANELLOC
     endscript
 }
 LOGROT_EOF
-    ok "Logrotate policy installed (daily, 14 rotations)."
 
     if nginx -t; then
-        if systemctl restart nginx; then
-            ok "Nginx running on ${HTTPS_PORT} for CDN=${CDN_DOMAIN}, Panel=${PANEL_DOMAIN}!"
-        else
-            err "nginx -t passed but restart failed. Run: systemctl status nginx -l"
+        if ! systemctl restart nginx; then
             return 1
         fi
     else
-        err "nginx -t FAILED. Config written but NOT activated."
         return 1
     fi
-
-    echo ""
-    echo -e "${INFO}================= ROUTING SUMMARY =================${RESET}"
-    echo -e "${C4}CDN domain:${RESET}   ${CDN_DOMAIN}  (ws/xhttp/httpupgrade only)"
-    echo -e "${C5}Panel domain:${RESET} ${PANEL_DOMAIN}  (-> 127.0.0.1:${PANEL_PORT})"
-    if [ -n "$CDN_ROUTED_SUMMARY" ]; then
-        echo -e "${CDN_BG} Routed through CDN: ${RESET}"
-        echo -e "${CDN_ROUTED_SUMMARY}"
-    fi
-    if [ -n "$HOSTFIX_SUMMARY" ]; then
-        echo -e "${FIX_BG} DB fixed (Host/mode + listen rebound): ${RESET}"
-        echo -e "${HOSTFIX_SUMMARY}"
-    fi
-    if [ -n "$FAILED_SUMMARY" ]; then
-        echo -e "${ERR_BG} FAILED (will NOT work): ${RESET}"
-        echo -e "${FAILED_SUMMARY}"
-    fi
-    if [ -n "$NONCDN_SUMMARY" ]; then
-        echo -e "${SKIP_BG} Left direct (non-CDN): ${RESET}"
-        echo -e "${NONCDN_SUMMARY}"
-    fi
-    echo -e "${INFO}=====================================================${RESET}"
 }
 
-# ---------------- Real IP / CDN Ranges ----------------
 fetch_cloudflare_ranges() {
     v4=$(wget -qO- --timeout=10 https://www.cloudflare.com/ips-v4 2>/dev/null | tr '\n' ' ')
     v6=$(wget -qO- --timeout=10 https://www.cloudflare.com/ips-v6 2>/dev/null | tr '\n' ' ')
     printf '%s' "$v4" | grep -q '/' && CF_V4=$(printf '%s' "$v4" | tr -s ' ') || CF_V4="$CF_V4_DEFAULT"
     printf '%s' "$v6" | grep -q '/' && CF_V6=$(printf '%s' "$v6" | tr -s ' ') || CF_V6="$CF_V6_DEFAULT"
 }
+
 fetch_arvan_ranges() {
     v4=$(wget -qO- --timeout=12 -U "Mozilla/5.0" https://www.arvancloud.ir/en/ips.txt 2>/dev/null | tr -d '\r')
     v4=$(printf '%s\n' "$v4" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u | tr '\n' ' ')
@@ -1511,6 +1033,7 @@ fetch_arvan_ranges() {
     } || ARVAN_V4="$ARVAN_V4_DEFAULT"
     ARVAN_V6="$ARVAN_V6_DEFAULT"
 }
+
 write_realip() {
     local provider="$1" f hdr ranges4 ranges6
     case "$provider" in
@@ -1525,17 +1048,16 @@ write_realip() {
         *) return 1 ;;
     esac
     {
-        echo "# Real-IP from ${provider}"
         for c in $ranges4; do echo "set_real_ip_from $c;"; done
         for c in $ranges6; do echo "set_real_ip_from $c;"; done
         echo "real_ip_header ${hdr};"
         echo "real_ip_recursive on;"
     } > "$f"
-    nginx -t >/dev/null 2>&1 && ok "${provider} real-IP enabled." || rm -f "$f"
+    nginx -t >/dev/null 2>&1 || rm -f "$f"
 }
+
 write_cf_realip() { write_realip cloudflare; }
 
-# ---------------- Whitelist GoldIP IP Resolver ----------------
 resolve_domain_ips() {
     local domain="$1" ips=""
     if command -v dig >/dev/null 2>&1; then ips=$(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ' '); fi
@@ -1548,21 +1070,15 @@ whitelist_goldip() {
     local ip hit=0
     local ips; ips=$(resolve_domain_ips "$GOLDIP_TRUSTED")
     for ip in $ips; do
-        ufw allow from "$ip" >/dev/null 2>&1 && { ok "Whitelisted ${GOLDIP_TRUSTED} (${ip})"; hit=1; }
+        ufw allow from "$ip" >/dev/null 2>&1 && hit=1
     done
-    [ "$hit" -eq 1 ] || warn "Could not whitelist ${GOLDIP_TRUSTED}."
 }
 
-# ---------------- Firewall (UFW) ----------------
 setup_firewall() {
     command -v ufw >/dev/null 2>&1 || run_with_spinner "Installing ufw" apt-get install -y ufw >/dev/null
 
     local CDN_CHOICE
-    ask_choice CDN_CHOICE "CDN:" \
-        "1:Cloudflare" \
-        "2:ArvanCloud" \
-        "3:Both" \
-        "4:Custom"
+    ask_choice CDN_CHOICE "CDN:" "1:Cloudflare" "2:ArvanCloud" "3:Both" "4:Custom"
     local RANGES="" RANGES6=""
     case "$CDN_CHOICE" in
         1) fetch_cloudflare_ranges; RANGES="$CF_V4"; RANGES6="$CF_V6" ;;
@@ -1615,7 +1131,6 @@ setup_firewall() {
     fi
 
     ufw --force enable >/dev/null
-    ok "Firewall configured."
 
     command -v nginx >/dev/null 2>&1 && {
         local RIP
@@ -1626,9 +1141,9 @@ setup_firewall() {
         esac
     }
 }
-firewall_status() { command -v ufw >/dev/null 2>&1 && ufw status verbose || warn "ufw not installed."; }
 
-# ---------------- Persistence & Watchdog ----------------
+firewall_status() { command -v ufw >/dev/null 2>&1 && ufw status verbose; }
+
 install_watchdog() {
     cat > /usr/local/bin/goldip-watchdog.sh <<'WEOF'
 #!/bin/bash
@@ -1659,7 +1174,6 @@ WantedBy=timers.target
 TEOF
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable --now goldip-watchdog.timer >/dev/null 2>&1
-    ok "Watchdog installed (60s interval)."
 }
 
 enable_persistence() {
@@ -1691,43 +1205,34 @@ RestartSec=3s
 XEOF
     fi
     systemctl daemon-reload >/dev/null 2>&1
-    ok "Auto-restart applied."
     [ "$mode" = "silent" ] && return
-    systemctl list-unit-files 2>/dev/null | grep -q '^goldip-watchdog\.timer' && ok "Watchdog active." \
-        || { local WD; ask_optional WD "Install watchdog?" "[y/N]"; is_yes "$WD" && install_watchdog; }
+    systemctl list-unit-files 2>/dev/null | grep -q '^goldip-watchdog\.timer' || { local WD; ask_optional WD "Install watchdog?" "[y/N]"; is_yes "$WD" && install_watchdog; }
 }
 
-# ---------------- FULL UNINSTALL ----------------
 full_uninstall() {
-    echo -e "${ERR_BG} WARNING ${RESET} ${C_ERR}This removes Nginx, all configs, logs and the watchdog!${RESET}"
     local CONFIRM; ask_optional CONFIRM "Type YES to confirm"
-    [ "$CONFIRM" = "YES" ] || { warn "Cancelled."; return; }
+    [ "$CONFIRM" = "YES" ] || return
 
-    echo -e "${INFO}--- 1/7 stopping services ---${RESET}"
     systemctl stop nginx 2>&1
     systemctl disable nginx 2>&1
     systemctl stop goldip-watchdog.timer 2>&1
     systemctl disable goldip-watchdog.timer 2>&1
 
-    echo -e "${INFO}--- 2/7 removing watchdog ---${RESET}"
     rm -fv /etc/systemd/system/goldip-watchdog.service \
            /etc/systemd/system/goldip-watchdog.timer \
            /usr/local/bin/goldip-watchdog.sh
 
-    echo -e "${INFO}--- 3/7 removing systemd drop-ins ---${RESET}"
     rm -rfv /etc/systemd/system/nginx.service.d
     rm -fv /etc/systemd/system/multi-user.target.wants/nginx.service 2>/dev/null
     systemctl daemon-reload
     systemctl reset-failed nginx 2>/dev/null
 
-    echo -e "${INFO}--- 4/7 purging nginx packages ---${RESET}"
     run_with_spinner "Purging packages" apt-get purge -y \
         nginx nginx-common nginx-core nginx-light nginx-full nginx-extras \
         libnginx-mod-* 2>&1
     apt-get autoremove -y --purge 2>&1
     apt-get autoclean -y 2>&1
 
-    echo -e "${INFO}--- 5/7 removing files ---${RESET}"
     rm -rfv /etc/nginx
     rm -rfv /var/log/nginx
     rm -rfv /var/www/goldip
@@ -1735,40 +1240,19 @@ full_uninstall() {
     rm -rfv /var/lib/nginx
     rm -fv  /etc/logrotate.d/nginx
 
-    echo -e "${INFO}--- 6/7 removing certbot hook ---${RESET}"
     rm -fv /etc/letsencrypt/renewal-hooks/deploy/goldip-nginx-reload.sh
 
-    echo -e "${INFO}--- 7/7 verification ---${RESET}"
     local leftover=0
-    if command -v nginx >/dev/null 2>&1; then
-        err "nginx binary still present: $(command -v nginx)"
-        leftover=1
-    fi
-    if dpkg -l 2>/dev/null | grep -qE '^ii\s+nginx'; then
-        err "dpkg still reports an nginx-* package:"
-        dpkg -l | grep -E '^ii\s+nginx'
-        leftover=1
-    fi
-    if [ -d /etc/nginx ]; then
-        err "/etc/nginx still exists."
-        leftover=1
-    fi
-    if systemctl list-unit-files 2>/dev/null | grep -q '^nginx\.service'; then
-        err "systemd still has nginx.service registered."
-        leftover=1
-    fi
-
-    if [ "$leftover" -eq 0 ]; then
-        ok "Nginx fully uninstalled."
-    else
-        err "Some leftovers detected above -- review manually."
-    fi
+    if command -v nginx >/dev/null 2>&1; then leftover=1; fi
+    if dpkg -l 2>/dev/null | grep -qE '^ii\s+nginx'; then leftover=1; fi
+    if [ -d /etc/nginx ]; then leftover=1; fi
+    if systemctl list-unit-files 2>/dev/null | grep -q '^nginx\.service'; then leftover=1; fi
 }
 
 uninstall_domain() {
     local D; ask D "Domain"
     rm -f "${NGINX_CONF_DIR}/${D}.conf"
-    command -v nginx >/dev/null 2>&1 && nginx -t 2>/dev/null && systemctl reload nginx && ok "Removed." || ok "Removed (nginx not running)."
+    command -v nginx >/dev/null 2>&1 && nginx -t 2>/dev/null && systemctl reload nginx
 }
 
 colorize_access_line() {
@@ -1783,11 +1267,10 @@ colorize_access_line() {
 }
 
 view_logs() {
-    local logdir="/var/log/nginx"; [ -d "$logdir" ] || { err "No logs."; return; }
+    local logdir="/var/log/nginx"; [ -d "$logdir" ] || return
     local -a LOGS; local f i=0
     for f in "$logdir"/*.log; do [ -f "$f" ] || continue; i=$((i+1)); LOGS[$i]="$f"; done
-    [ "$i" -gt 0 ] || { warn "No logs found."; return; }
-    echo -e "${INFO}Logs:${RESET}"
+    [ "$i" -gt 0 ] || return
     for n in $(seq 1 "$i"); do echo -e "    ${C6}${n}) ${LOGS[$n]}${RESET}"; done
     local PICK; ask_number PICK "Select"
     { [ "$PICK" -ge 1 ] && [ "$PICK" -le "$i" ]; } || return
@@ -1796,26 +1279,25 @@ view_logs() {
 
 svc() {
     case "$1" in
-        start)   systemctl start nginx   && ok "Started"   || err "Start failed" ;;
-        stop)    systemctl stop nginx    && ok "Stopped"   || err "Stop failed" ;;
-        restart) systemctl restart nginx && ok "Restarted" || err "Restart failed" ;;
-        reload)  nginx -t 2>/dev/null && systemctl reload nginx && ok "Reloaded" || err "Reload failed" ;;
+        start)   systemctl start nginx ;;
+        stop)    systemctl stop nginx ;;
+        restart) systemctl restart nginx ;;
+        reload)  nginx -t 2>/dev/null && systemctl reload nginx ;;
     esac
 }
+
 show_status() {
-    systemctl is-active --quiet nginx && ok "Nginx ACTIVE" || err "Nginx INACTIVE"
-    systemctl is-active --quiet x-ui && ok "x-ui ACTIVE" || err "x-ui INACTIVE"
-    echo -e "${INFO}--- Listening ports (80/443) ---${RESET}"
-    ss -tlnp 2>/dev/null | grep -E ':80 |:443 ' || warn "Nothing listening on 80/443."
+    systemctl is-active --quiet nginx
+    systemctl is-active --quiet x-ui
+    ss -tlnp 2>/dev/null | grep -E ':80 |:443 '
     nginx -t 2>&1
 }
 
-# ---------------- Main Menu ----------------
 do_install() {
     install_nginx || return 1
     ensure_sqlite3
     gather_inputs
-    write_config || { err "Install aborted: nginx config invalid. See errors above."; return 1; }
+    write_config || return 1
     enable_persistence silent
 }
 
@@ -1836,7 +1318,6 @@ menu() {
             4) menu_diagnostics ;;
             5) full_uninstall ;;
             0) exit 0 ;;
-            *) err "Invalid choice." ;;
         esac
         local _; ask_optional _ "Press Enter to continue..."
     done
@@ -1863,7 +1344,6 @@ menu_server_management() {
             6) view_logs ;;
             7) enable_persistence ;;
             0) return ;;
-            *) err "Invalid choice." ;;
         esac
         local _; ask_optional _ "Press Enter to continue..."
     done
@@ -1882,7 +1362,6 @@ menu_domain_firewall() {
             2) setup_firewall ;;
             3) firewall_status ;;
             0) return ;;
-            *) err "Invalid choice." ;;
         esac
         local _; ask_optional _ "Press Enter to continue..."
     done
@@ -1899,10 +1378,10 @@ menu_diagnostics() {
             1) verify_cdn_binding_menu ;;
             2) diagnose_delayed_disconnect ;;
             0) return ;;
-            *) err "Invalid choice." ;;
         esac
         local _; ask_optional _ "Press Enter to continue..."
     done
 }
 
-require_root; menu
+require_root
+menu
