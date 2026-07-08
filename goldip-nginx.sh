@@ -25,21 +25,23 @@
 #  A single overall confirmation is still shown up front, and a timestamped
 #  backup of x-ui.db is still always taken first.
 #
-#  BUG E: XHTTP inbounds kept whatever "mode" the user had originally
-#  chosen in the x-ui panel, and were fronted with nginx grpc_pass. The
-#  transport "mode" MUST agree with the nginx directive fronting it. The two
-#  valid pairings (XTLS/Xray-core discussions #4113 and #4118) are:
-#     * mode "auto"/"stream-up"/"stream-one"  <->  nginx grpc_pass
-#       (h2/gRPC-disguised; grpc_pass does NOT support HTTP/1.1, and over
-#        Cloudflare requires the Network -> gRPC toggle to be enabled)
-#     * mode "packet-up"                       <->  nginx proxy_pass (HTTP/1.1)
-#       (ordinary HTTP requests; the Xray author calls this the mode with the
-#        STRONGEST CDN/reverse-proxy compatibility -- #4113)
-#  Because this script targets Cloudflare/ArvanCloud users who do NOT toggle
-#  gRPC on and expect it to "just work", the grpc_pass path silently failed
-#  for XHTTP. FIX: XHTTP is now fronted with proxy_pass over HTTP/1.1 and its
-#  inbound "mode" is forced to "packet-up" -- the pairing that works through
-#  Cloudflare with default settings and matches published working configs.
+#  BUG E: XHTTP inbounds had their transport "mode" force-set on the SERVER
+#  side (first to "auto", later to "packet-up" to pair with nginx proxy_pass),
+#  while the CLIENT's own mode was whatever x-ui's exported link used --
+#  almost always left at Xray's client-side default "auto". Per the Xray
+#  author (XTLS/Xray-core discussion #4113): the client's "auto" picks
+#  stream-up whenever it negotiates H2 over TLS (which it will, since the
+#  CDN/nginx edge offers h2 ALPN); AND the server, once its "mode" is set to
+#  one specific value, ONLY accepts that exact mode and rejects everything
+#  else. A server hard-locked to "packet-up" therefore rejected a client that
+#  showed up as stream-up -- a real client/server mode mismatch, and the
+#  reason XHTTP alone (the only transport with a "mode" concept) kept failing
+#  while ws/httpupgrade worked fine. FIX: the server no longer forces "mode"
+#  at all -- Xray's documented default is to accept packet-up, stream-up, AND
+#  stream-one simultaneously when the field is left unset, so whatever mode
+#  the client actually sends is accepted. The existing nginx location
+#  (proxy_pass, HTTP/1.1, request/response buffering off) already carries any
+#  of those transparently; no nginx-side change was needed for this part.
 #
 #  BUG F: every DB-mutating call in the apply loop (the raw sqlite3
 #  UPDATE/DELETE calls, strip_tls_py, insert_host_py) had its exit code
@@ -311,10 +313,11 @@ install_nginx() {
 # so the backend inbound always sees the CDN domain regardless of what the
 # client sent.
 #
-# XHTTP is fronted with proxy_pass over HTTP/1.1 (mode "packet-up"), the
-# pairing with the strongest CDN compatibility -- it works through Cloudflare
-# and ArvanCloud without enabling any gRPC toggle. Response buffering is
-# turned off so the long-lived down-link stream is not held by nginx.
+# XHTTP is fronted with proxy_pass over HTTP/1.1, which carries packet-up,
+# stream-up, and stream-one alike since none of them require literal gRPC
+# wire framing -- they're ordinary HTTP requests with a cosmetic disguise
+# header. Response/request buffering is turned off so the long-lived
+# down-link stream and streamed up-link body are not held by nginx.
 make_location() {
     local t="$1" p="$2" port="$3" hostheader="$4"
     [ "${p:0:1}" != "/" ] && p="/$p"
@@ -441,19 +444,19 @@ PYEOF
 # exact "ws/xhttp won't connect" symptom the user hit). Routing is by PATH,
 # which nginx already enforces, so empty host is correct and safe.
 #
-# For xhttp/splithttp it also forces mode "packet-up", which pairs with nginx
-# proxy_pass over HTTP/1.1 and has the strongest CDN compatibility (works
-# through Cloudflare/ArvanCloud with default settings). The stream modes
-# ("auto"/"stream-up") would instead require grpc_pass + HTTP/2 + Cloudflare's
-# gRPC toggle -- a manual step most users never do -- so they are avoided.
+# For xhttp/splithttp it also leaves "mode" unset (removing any prior value)
+# so the server accepts packet-up, stream-up, and stream-one alike, matching
+# whatever mode the client actually negotiates -- forcing one specific mode
+# server-side while the client defaults to a different one is what silently
+# broke XHTTP earlier (see the BUG E note at the top of this file).
 #
 # uTLS fingerprint ("chrome") is set once in insert_host_py for all
 # CDN-eligible transports (ws, httpupgrade, xhttp/splithttp) -- that field
 # lives in the "hosts" table and applies uniformly regardless of transport.
 #
-# xpaddingBytes padding is XHTTP-ONLY: per Xray-core's transport schemas,
+# xPaddingBytes padding is XHTTP-ONLY: per Xray-core's transport schemas,
 # wsSettings/httpupgradeSettings define no such field at all -- only
-# xhttpSettings/splithttpSettings expose "extra.xpaddingBytes".
+# xhttpSettings/splithttpSettings expose "extra.xPaddingBytes".
 strip_tls_py() {
     python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
 import sqlite3, json, sys
@@ -491,15 +494,26 @@ try:
         s_key = net + "Settings"
         xs = ss.setdefault(s_key, {})
         xs["host"] = ""             # accept any Host (no server-side validation)
-        # Pair with nginx proxy_pass (HTTP/1.1). "packet-up" has the strongest
-        # CDN/reverse-proxy compatibility (Xray author, discussion #4113) and
-        # works over Cloudflare/ArvanCloud with default settings, unlike the
-        # stream modes ("auto"/"stream-up"/"stream-one") which need grpc_pass
-        # + HTTP/2 + Cloudflare's gRPC toggle enabled. It is forced here so a
-        # stale user-chosen stream mode can't break the route.
-        xs["mode"] = "packet-up"
+        # Do NOT force "mode" here. Per the Xray author (discussion #4113):
+        # "server: by default accepts all three modes at once; if set to a
+        # specific mode, it ONLY accepts that one" -- and the client's own
+        # "mode" defaults to "auto", which picks stream-up whenever it
+        # negotiates H2 over TLS (which it will, since the CDN/nginx edge
+        # offers h2). A server hard-locked to "packet-up" then REJECTS that
+        # client outright -- a real client/server mode mismatch, and exactly
+        # why XHTTP alone (the only transport with a "mode" concept) was
+        # failing while ws/httpupgrade kept working. Leaving "mode" unset
+        # makes the server accept packet-up, stream-up, AND stream-one, so it
+        # always matches whatever the client actually sends. This nginx
+        # config (proxy_pass, HTTP/1.1, request/response buffering off)
+        # already carries any of those transparently -- no nginx change
+        # needed. Forcing a single mode is only for penetrating some OTHER
+        # CDN/middlebox that mishandles one of them, which doesn't apply to
+        # our own nginx.
+        xs.pop("mode", None)
         extra = xs.setdefault("extra", {})
-        extra["xpaddingBytes"] = "100-1000"
+        extra.pop("xpaddingBytes", None)       # remove stale wrong-case key from earlier runs
+        extra["xPaddingBytes"] = "100-1000"    # canonical casing
     else:
         print(f"ERROR: unsupported network type '{net}'", file=sys.stderr)
         sys.exit(1)
@@ -1155,7 +1169,7 @@ gather_inputs() {
                 2) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location xhttp "$P_PATH" "$P_PORT" "$PRIMARY")"
                    CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [xhttp] ${P_PATH} -> via ${PRIMARY} (manual)"
                    warn "Manual entry does NOT touch x-ui's inbound. In x-ui set Security to"
-                   warn "'none', leave host EMPTY, and set XHTTP mode to 'packet-up', or use Auto." ;;
+                   warn "'none', leave host EMPTY, and leave XHTTP mode unset/Auto, or use Auto." ;;
             esac
             i=$((i+1))
         done
