@@ -26,25 +26,20 @@
 #  backup of x-ui.db is still always taken first.
 #
 #  BUG E: XHTTP inbounds kept whatever "mode" the user had originally
-#  chosen in the x-ui panel. The transport "mode" MUST agree with the nginx
-#  directive fronting it, and they were not being kept in sync. The two
-#  valid pairings (XTLS/Xray-core discussion #4113 and the official
-#  XTLS/Xray-examples VLESS-XHTTP-Nginx config) are:
+#  chosen in the x-ui panel, and were fronted with nginx grpc_pass. The
+#  transport "mode" MUST agree with the nginx directive fronting it. The two
+#  valid pairings (XTLS/Xray-core discussions #4113 and #4118) are:
 #     * mode "auto"/"stream-up"/"stream-one"  <->  nginx grpc_pass
-#       (these modes wear an h2/gRPC disguise; grpc_pass carries them)
-#     * mode "packet-up"                       <->  nginx proxy_pass (plain HTTP)
-#       (packet-up sends ordinary HTTP POST packets, NOT gRPC framing)
-#  This script fronts XHTTP with grpc_pass, so the ONLY correct mode here is
-#  the gRPC-disguised family. Discussion #5386 shows a user getting a hard
-#  502 Bad Gateway from exactly the wrong pairing (mode packet-up behind an
-#  h2/grpc_pass nginx). FIX: every XHTTP/SplitHTTP inbound this script
-#  rewires for CDN use has its transport "mode" forced to "auto" -- which on
-#  current Xray resolves to stream-up, the h2/gRPC-disguised mode grpc_pass
-#  is built to carry. This matches the official example verbatim. (The
-#  maintainers' separate "packet-up is most compatible" note in #4113 is
-#  explicitly about *other* CDNs / reverse proxies you can't otherwise get
-#  through -- not about a local nginx you control, where grpc_pass+auto is
-#  the documented, simplest, working path.)
+#       (h2/gRPC-disguised; grpc_pass does NOT support HTTP/1.1, and over
+#        Cloudflare requires the Network -> gRPC toggle to be enabled)
+#     * mode "packet-up"                       <->  nginx proxy_pass (HTTP/1.1)
+#       (ordinary HTTP requests; the Xray author calls this the mode with the
+#        STRONGEST CDN/reverse-proxy compatibility -- #4113)
+#  Because this script targets Cloudflare/ArvanCloud users who do NOT toggle
+#  gRPC on and expect it to "just work", the grpc_pass path silently failed
+#  for XHTTP. FIX: XHTTP is now fronted with proxy_pass over HTTP/1.1 and its
+#  inbound "mode" is forced to "packet-up" -- the pairing that works through
+#  Cloudflare with default settings and matches published working configs.
 #
 #  BUG F: every DB-mutating call in the apply loop (the raw sqlite3
 #  UPDATE/DELETE calls, strip_tls_py, insert_host_py) had its exit code
@@ -316,29 +311,38 @@ install_nginx() {
 # so the backend inbound always sees the CDN domain regardless of what the
 # client sent.
 #
-# XHTTP uses grpc_pass (stock nginx ngx_http_grpc_module) because this
-# script pins the inbound to mode "auto" (-> stream-up), which wears an
-# h2/gRPC disguise. grpc_pass is the directive built to carry that framing,
-# and this pairing matches the official XTLS/Xray-examples VLESS-XHTTP-Nginx
-# reference nginx.conf. NOTE: grpc_pass must NOT be paired with mode
-# "packet-up" (that mode sends plain HTTP POSTs and needs proxy_pass); the
-# two are kept in lock-step -- see strip_tls_py, which forces mode "auto".
-#
-# Xray-core's gRPC transport only honours X-Real-IP for the client address
-# (confirmed by a maintainer in discussion #3538); passing X-Forwarded-For
-# over grpc_pass has been reported to break the connection, so only
-# X-Real-IP is set on the grpc path.
+# XHTTP is fronted with proxy_pass over HTTP/1.1 (mode "packet-up"), the
+# pairing with the strongest CDN compatibility -- it works through Cloudflare
+# and ArvanCloud without enabling any gRPC toggle. Response buffering is
+# turned off so the long-lived down-link stream is not held by nginx.
 make_location() {
     local t="$1" p="$2" port="$3" hostheader="$4"
     [ "${p:0:1}" != "/" ] && p="/$p"
     if [ "$t" = "xhttp" ]; then
+        # XHTTP behind a CDN is served over plain HTTP/1.1 with proxy_pass,
+        # NOT grpc_pass. Per the Xray author (discussion #4113) packet-up mode
+        # has "the strongest compatibility" with CDNs/reverse proxies, and
+        # (discussion #4118) "grpc_pass does not support HTTP/1.1 -- use
+        # proxy_pass if you need it". grpc_pass would additionally require the
+        # user to manually switch Cloudflare's Network -> gRPC toggle ON and
+        # force HTTP/2 origin pulls; without that the XHTTP inbound silently
+        # fails. proxy_pass + HTTP/1.1 + packet-up works through Cloudflare
+        # (and ArvanCloud) with default settings. Response buffering MUST be
+        # off so the long-lived down-link GET stream is not held by nginx.
         printf '    location ^~ %s {\n' "$p"
+        printf '        proxy_pass http://127.0.0.1:%s;\n' "$port"
+        printf '        proxy_http_version 1.1;\n'
+        printf '        proxy_set_header Host %s;\n' "$hostheader"
+        printf '        proxy_set_header X-Real-IP $remote_addr;\n'
+        printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+        printf '        proxy_set_header X-Forwarded-Proto $scheme;\n'
+        printf '        proxy_set_header Connection "";\n'
         printf '        client_max_body_size 0;\n'
-        printf '        client_body_timeout 5m;\n'
-        printf '        grpc_read_timeout 315;\n'
-        printf '        grpc_send_timeout 5m;\n'
-        printf '        grpc_set_header X-Real-IP $remote_addr;\n'
-        printf '        grpc_pass grpc://127.0.0.1:%s;\n' "$port"
+        printf '        client_body_timeout 1h;\n'
+        printf '        proxy_buffering off;\n'
+        printf '        proxy_request_buffering off;\n'
+        printf '        proxy_read_timeout 1h;\n'
+        printf '        proxy_send_timeout 1h;\n'
         printf '    }\n'
     else
         printf '    location ^~ %s {\n' "$p"
@@ -396,10 +400,21 @@ PYEOF
 # QR/subscription LINK TEXT display -- NOT read by Xray-core for routing.
 # $4 (cdn_host) must always be CDN_DOMAIN; callers only ever have $PRIMARY
 # in scope at the call site, so PANEL_DOMAIN can never leak in here.
+# insert_host_py: writes the "hosts" (Managed Host) row that 3x-ui's
+# subscription/share-link generator reads to build each client's actual
+# connection link (address/port/path/sni/host-header/alpn/fingerprint).
+# CRITICAL: this is NOT purely cosmetic display text -- it is the source of
+# truth the client uses to connect. Previously "path" was hard-coded to an
+# empty string and "port" was hard-coded to the literal "443": a client's
+# generated ws/xhttp link would then carry NO path (so its request hits
+# nginx's "/" camouflage location instead of the real ^~ /path location) and
+# the WRONG port whenever HTTPS_PORT wasn't 443. Both looked like "successful
+# install, nothing connects" from the client's side even though nginx and
+# Xray's stream_settings were already correct. Both are now real parameters.
 insert_host_py() {
-    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYEOF'
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" <<'PYEOF'
 import sqlite3, sys, time
-db_path, inbound_id, remark, cdn_host, port, sni, alpn_json = sys.argv[1:8]
+db_path, inbound_id, remark, cdn_host, port, sni, path, alpn_json = sys.argv[1:9]
 now_ms = int(time.time() * 1000)
 try:
     con = sqlite3.connect(db_path)
@@ -409,8 +424,8 @@ try:
             inbound_id, sort_order, remark, server_description, is_disabled, is_hidden,
             address, port, security, sni, host_header, path, alpn, fingerprint, override_sni_from_address,
             keep_sni_blank, allow_insecure, created_at, updated_at
-        ) VALUES (?, 0, ?, '', 0, 0, ?, ?, 'tls', ?, ?, '', ?, 'chrome', 1, 0, 0, ?, ?)
-    """, (int(inbound_id), remark, cdn_host, int(port), sni, cdn_host, alpn_json, now_ms, now_ms))
+        ) VALUES (?, 0, ?, '', 0, 0, ?, ?, 'tls', ?, ?, ?, ?, 'chrome', 1, 0, 0, ?, ?)
+    """, (int(inbound_id), remark, cdn_host, int(port), sni, cdn_host, path, alpn_json, now_ms, now_ms))
     con.commit(); con.close(); print("OK"); sys.exit(0)
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
@@ -418,19 +433,19 @@ PYEOF
 }
 
 # strip_tls_py force-rewrites the ACTUAL transport-level fields Xray-core
-# reads at handshake time (wsSettings.headers.Host / httpupgradeSettings.host
-# / xhttpSettings.host inside stream_settings) to the CDN domain, and forces
-# xhttp/splithttp "mode" to "auto".
+# reads at handshake time inside stream_settings. It sets security to "none"
+# (nginx already terminated the real TLS), removes tlsSettings/realitySettings,
+# and clears the transport "host" so the inbound performs NO server-side Host
+# validation -- behind a CDN + nginx the forwarded Host cannot be guaranteed,
+# and any mismatch would make newer Xray builds reject the handshake (the
+# exact "ws/xhttp won't connect" symptom the user hit). Routing is by PATH,
+# which nginx already enforces, so empty host is correct and safe.
 #
-# "auto" is the mode that MUST accompany nginx grpc_pass: on current Xray it
-# resolves to stream-up, which disguises itself as h2/gRPC so grpc_pass can
-# carry it -- exactly what the official XTLS/Xray-examples VLESS-XHTTP-Nginx
-# config uses. The wrong pairing (mode packet-up behind grpc_pass) returns a
-# hard 502 (see discussion #5386), because packet-up sends plain HTTP POSTs
-# that a grpc_pass upstream cannot parse. Since this script always fronts
-# XHTTP with grpc_pass, "auto" is the only correct value here, and it is
-# forced unconditionally so a stale user-chosen "packet-up" can't break the
-# route.
+# For xhttp/splithttp it also forces mode "packet-up", which pairs with nginx
+# proxy_pass over HTTP/1.1 and has the strongest CDN compatibility (works
+# through Cloudflare/ArvanCloud with default settings). The stream modes
+# ("auto"/"stream-up") would instead require grpc_pass + HTTP/2 + Cloudflare's
+# gRPC toggle -- a manual step most users never do -- so they are avoided.
 #
 # uTLS fingerprint ("chrome") is set once in insert_host_py for all
 # CDN-eligible transports (ws, httpupgrade, xhttp/splithttp) -- that field
@@ -456,22 +471,33 @@ try:
     for k in ("tlsSettings", "realitySettings", "externalProxy", "externalProxySettings"):
         ss.pop(k, None)
 
+    # NOTE on Host: we deliberately DO NOT pin a Host on the inbound. Behind a
+    # CDN + nginx front, pinning wsSettings/httpupgradeSettings/xhttpSettings
+    # "host" makes newer Xray builds validate the incoming Host header, and any
+    # mismatch (CDN rewriting Host, a client sub-link with a different host,
+    # nginx forwarding $host) makes Xray reject the handshake -- the exact
+    # "ws/xhttp don't connect" symptom. An empty host means "accept any Host",
+    # which is correct here because path-routing (not host-routing) selects the
+    # inbound, and the real TLS/SNI check already happened at the CDN + nginx.
     if net == "ws":
         ws = ss.setdefault("wsSettings", {})
         headers = ws.setdefault("headers", {})
-        headers["Host"] = cdn_host
+        headers.pop("Host", None)   # remove any pinned Host -> no host validation
+        ws["host"] = ""             # newer schema field, keep empty too
     elif net == "httpupgrade":
         hu = ss.setdefault("httpupgradeSettings", {})
-        hu["host"] = cdn_host
+        hu["host"] = ""             # accept any Host
     elif net in ("xhttp", "splithttp"):
         s_key = net + "Settings"
         xs = ss.setdefault(s_key, {})
-        xs["host"] = cdn_host
-        # FIX (BUG E): force the mode that pairs correctly with nginx
-        # grpc_pass. "auto" -> stream-up, which carries an h2/gRPC disguise
-        # grpc_pass is built for. "packet-up" (plain HTTP POSTs) behind
-        # grpc_pass returns 502, so it must never be used with this front.
-        xs["mode"] = "auto"
+        xs["host"] = ""             # accept any Host (no server-side validation)
+        # Pair with nginx proxy_pass (HTTP/1.1). "packet-up" has the strongest
+        # CDN/reverse-proxy compatibility (Xray author, discussion #4113) and
+        # works over Cloudflare/ArvanCloud with default settings, unlike the
+        # stream modes ("auto"/"stream-up"/"stream-one") which need grpc_pass
+        # + HTTP/2 + Cloudflare's gRPC toggle enabled. It is forced here so a
+        # stale user-chosen stream mode can't break the route.
+        xs["mode"] = "packet-up"
         extra = xs.setdefault("extra", {})
         extra["xpaddingBytes"] = "100-1000"
     else:
@@ -642,7 +668,13 @@ auto_build_locations() {
                 continue ;;
         esac
 
-        [ -z "$path" ] || [ "$path" = "/" ] && continue
+        if [ -z "$path" ] || [ "$path" = "/" ]; then
+            warn "Inbound \"${remark}\" (${net}, port ${port}) has no distinct path"
+            warn "(path='${path:-<empty>}'). A CDN inbound behind nginx MUST have a unique"
+            warn "path like /mypath so nginx can route it; otherwise it collides with the"
+            warn "camouflage site and returns 404. Set a path on this inbound and re-run."
+            continue
+        fi
         fport="$port"
         if [ "$port" = "$HTTPS_PORT" ] || [ "$port" = "$HTTP_PORT" ]; then fport=$(free_port); fi
         TAKEN_PORTS="${TAKEN_PORTS} ${fport}"
@@ -684,7 +716,7 @@ auto_build_locations() {
     local applied_count=0
 
     for m in $(seq 1 "$op_count"); do
-        mid="${OP_IDS[$m]}"; mfport="${OP_FPORTS[$m]}"; mnet="${OP_NETS[$m]}"; malpn="${OP_ALPNS[$m]}"; mremark="${OP_REMARKS[$m]}"
+        mid="${OP_IDS[$m]}"; mfport="${OP_FPORTS[$m]}"; mnet="${OP_NETS[$m]}"; malpn="${OP_ALPNS[$m]}"; mremark="${OP_REMARKS[$m]}"; mpath="${OP_PATHS[$m]}"
         local step_ok=1
 
         if ! sqlite3 "$db" "UPDATE inbounds SET listen='127.0.0.1', port=${mfport} WHERE id=${mid};" 2>/tmp/goldip_sqlerr; then
@@ -704,7 +736,7 @@ auto_build_locations() {
         if [ "$step_ok" -eq 1 ] && [ "$HOSTS_TABLE_PRESENT" -eq 1 ]; then
             sqlite3 "$db" "DELETE FROM hosts WHERE inbound_id=${mid};" 2>/dev/null
             local host_out
-            host_out=$(insert_host_py "$db" "$mid" "$mnet" "$PRIMARY" "443" "$PRIMARY" "$malpn" 2>&1)
+            host_out=$(insert_host_py "$db" "$mid" "$mremark" "$PRIMARY" "$HTTPS_PORT" "$PRIMARY" "$mpath" "$malpn" 2>&1)
             if [ "$host_out" != "OK" ]; then
                 warn "Cosmetic subscription-link update failed for #${mid} (\"${mremark}\") -- routing is unaffected: ${host_out}"
             fi
@@ -1118,12 +1150,12 @@ gather_inputs() {
             case "$P_TYPE" in
                 1) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location upgrade "$P_PATH" "$P_PORT" "$PRIMARY")"
                    CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [ws/httpupgrade] ${P_PATH} -> via ${PRIMARY} (manual)"
-                   warn "Manual entry does NOT touch x-ui's transport Host field. Set it to"
-                   warn "${PRIMARY} yourself in x-ui, or use Auto instead." ;;
+                   warn "Manual entry does NOT touch x-ui's inbound. In x-ui set this inbound's"
+                   warn "Security to 'none' and leave the transport Host EMPTY, or use Auto." ;;
                 2) LOCATIONS="${LOCATIONS}"$'\n'"$(make_location xhttp "$P_PATH" "$P_PORT" "$PRIMARY")"
                    CDN_ROUTED_SUMMARY="${CDN_ROUTED_SUMMARY}"$'\n'"  - [xhttp] ${P_PATH} -> via ${PRIMARY} (manual)"
-                   warn "Manual entry does NOT touch x-ui's transport host/mode fields. Set"
-                   warn "host to ${PRIMARY} and mode to auto yourself in x-ui, or use Auto." ;;
+                   warn "Manual entry does NOT touch x-ui's inbound. In x-ui set Security to"
+                   warn "'none', leave host EMPTY, and set XHTTP mode to 'packet-up', or use Auto." ;;
             esac
             i=$((i+1))
         done
