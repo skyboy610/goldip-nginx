@@ -1,6 +1,32 @@
 #!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v4.4
+#  GoldIP Nginx Camouflage Installer & Manager  v4.5
+#
+#  CHANGELOG v4.5 -- XHTTP-only failures (ws/httpupgrade already worked):
+#
+#  BUG G (THE REAL XHTTP BUG): nginx's xhttp location forced
+#  "proxy_set_header Host <CDN domain>" upstream to Xray, same as ws and
+#  httpupgrade get. Unlike ws/httpupgrade (a different Go code path each),
+#  XHTTP's own server handler (transport/internet/splithttp) validates the
+#  incoming Host/path itself as part of its session routing -- an external
+#  CDN-domain Host value is exactly the kind of thing that trips this and
+#  gets the connection rejected, while ws/httpupgrade tolerate it fine. FIX:
+#  no Host override at all for the xhttp location; nginx now sends its own
+#  default ($proxy_host, i.e. the literal 127.0.0.1:port backend address),
+#  which XHTTP's handler accepts. Also fixed the xhttp padding field's exact
+#  documented casing, "xPaddingBytes" (was "xpaddingBytes"), and this run
+#  cleans up that stale lower-case key if a prior version already wrote it.
+#
+#  RE-THEME (cosmetic, no behavior change beyond the above): standard ANSI
+#  colors 1-7 + gray replace the old ad-hoc 256-color palette everywhere in
+#  the menu/section text, one distinct color per line. Green/red/orange
+#  BACKGROUND badges are reserved exclusively for ok/warn/err messages and
+#  never used decoratively elsewhere (fixed WARN_BG to orange-bg/black-text,
+#  was yellow-bg/white-text; CDN_BG no longer uses a green background).
+#  Header is now a solid/filled block-font banner (was a thin outline font).
+#  An INSTALLED/NOT INSTALLED banner (green/red) now shows under the header
+#  on every menu screen. The flat 14-item management menu is now grouped
+#  into submenus: Server Management, Domain & Firewall, Diagnostics.
 #
 #  CHANGELOG v4.4 -- root cause of "no CDN inbound works at all":
 #
@@ -76,36 +102,39 @@ set -uo pipefail
 
 RESET='\033[0m'
 
-# ---------------- Color Palette (256-color ANSI) ----------------
-C_OK='\033[1;32m'      # green  - success ONLY
-C_ERR='\033[1;31m'     # red    - delete / error ONLY
+# ---------------- Color Palette (standard ANSI, colors 1-7 + gray) ----------------
+# Only these 8 colors are used anywhere in this script's visible menu/section
+# text, one distinct color per line, cycling in a fixed order for
+# readability. Green/red/orange BACKGROUND badges are reserved exclusively
+# for status messages (ok/warn/err below) and are never used decoratively.
+C1='\033[1;31m'   # 1 red
+C2='\033[1;32m'   # 2 green
+C3='\033[1;33m'   # 3 yellow
+C4='\033[1;34m'   # 4 blue
+C5='\033[1;35m'   # 5 magenta
+C6='\033[1;36m'   # 6 cyan
+C7='\033[1;37m'   # 7 white
+C8='\033[0;90m'   # 8 gray
 
-C_PINK='\033[1;38;5;213m'
-C_OLIVE='\033[1;38;5;100m'
-C_LPINK='\033[1;38;5;217m'
-C_TEALGREY='\033[1;38;5;108m'
-C_CHOC='\033[1;38;5;130m'
-C_LCHOC='\033[1;38;5;180m'
-C_SKY='\033[1;38;5;75m'
-C_PURPLE='\033[1;38;5;141m'
-C_GOLD='\033[1;38;5;220m'
-C_ORANGE='\033[1;38;5;208m'
-C_DEEPTEAL='\033[1;38;5;37m'
-C_SLATE='\033[1;38;5;103m'
-C_ROSE='\033[1;38;5;168m'
-C_LIME='\033[1;38;5;154m'
-C_CYAN2='\033[1;38;5;51m'
-C_MAGENTA2='\033[1;38;5;201m'
-C_AMBER='\033[1;38;5;214m'
+TITLE="$C6"; INFO="$C4"
 
-TITLE='\033[1;36m'; INFO='\033[1;34m'
-OK_BG='\033[42m\033[30m'; WARN_BG='\033[43m\033[97m'; ERR_BG='\033[41m\033[97m'
+# Backward-compat aliases for genuine status-indicator rows elsewhere in the
+# script (verify/diagnose tables marking a row OK/DOWN) -- these are
+# message-equivalent, not decoration, so they keep using green/red.
+C_OK="$C2"
+C_ERR="$C1"
+
+# Reserved EXCLUSIVELY for status messages (ok/warn/err) -- never used
+# decoratively anywhere else in this script.
+OK_BG='\033[42m\033[30m'          # green bg,  black text -> success
+WARN_BG='\033[48;5;208m\033[30m'  # orange bg, black text -> warning
+ERR_BG='\033[41m\033[97m'         # red bg,    white text -> error
 
 SKIP_BG='\033[1;30;43m'   # yellow bg, black text -> skipped (non-CDN) inbound
-CDN_BG='\033[1;30;42m'    # green bg,  black text -> CDN-compatible inbound
 FIX_BG='\033[1;30;46m'    # cyan bg,   black text -> Host-header fix applied
+CDN_BG="$C6"              # cyan text (no bg) -> CDN-routed inbound label
 
-PALETTE=(C_PINK C_OLIVE C_LPINK C_TEALGREY C_CHOC C_LCHOC C_SKY C_PURPLE C_GOLD C_ORANGE C_DEEPTEAL C_SLATE C_ROSE C_LIME C_CYAN2 C_MAGENTA2 C_AMBER)
+PALETTE=(C1 C2 C3 C4 C5 C6 C7 C8)
 __cidx=0
 CURCOLOR=""
 nextcolor() {
@@ -252,15 +281,39 @@ strip_port() { printf '%s' "$1" | sed -E 's/:[0-9]+$//'; }
 # ---------------- Header & Essentials ----------------
 header() {
 cat <<'EOF'
-==========================================================
-   ____       _     _ ___ ____
-  / ___| ___ | | __| |_ _|  _ \
- | |  _ / _ \| |/ _` || || |_) |
- | |_| | (_) | | (_| || ||  __/
-  \____|\___/|_|\__,_|___|_|
-    N G I N X   C A M O U F L A G E   v4.4
-==========================================================
+ ██████╗  ██████╗ ██╗     ██████╗ ██╗██████╗
+██╔════╝ ██╔═══██╗██║     ██╔══██╗██║██╔══██╗
+██║  ███╗██║   ██║██║     ██║  ██║██║██████╔╝
+██║   ██║██║   ██║██║     ██║  ██║██║██╔═══╝
+╚██████╔╝╚██████╔╝███████╗██████╔╝██║██║
+ ╚═════╝  ╚═════╝ ╚══════╝╚═════╝ ╚═╝╚═╝
+       N G I N X   C A M O U F L A G E   v4.5
 EOF
+}
+
+# ---------------- Install status ----------------
+# 00-goldip-catchall.conf is written by write_config() only on a completed
+# install, and removed only by full_uninstall -- a reliable installed/not
+# marker with no separate state file needed.
+is_installed() {
+    [ -f "${NGINX_CONF_DIR}/00-goldip-catchall.conf" ]
+}
+
+install_status_banner() {
+    if is_installed; then
+        echo -e "${OK_BG}                        INSTALLED                        ${RESET}"
+    else
+        echo -e "${ERR_BG}                      NOT INSTALLED                      ${RESET}"
+    fi
+}
+
+draw_header() {
+    clear
+    echo -e "${TITLE}"
+    header
+    echo -e "${RESET}"
+    install_status_banner
+    echo ""
 }
 
 require_root() { [ "$(id -u)" -eq 0 ] || { err "Run as root."; exit 1; }; }
@@ -322,20 +375,21 @@ make_location() {
     local t="$1" p="$2" port="$3" hostheader="$4"
     [ "${p:0:1}" != "/" ] && p="/$p"
     if [ "$t" = "xhttp" ]; then
-        # XHTTP behind a CDN is served over plain HTTP/1.1 with proxy_pass,
-        # NOT grpc_pass. Per the Xray author (discussion #4113) packet-up mode
-        # has "the strongest compatibility" with CDNs/reverse proxies, and
-        # (discussion #4118) "grpc_pass does not support HTTP/1.1 -- use
-        # proxy_pass if you need it". grpc_pass would additionally require the
-        # user to manually switch Cloudflare's Network -> gRPC toggle ON and
-        # force HTTP/2 origin pulls; without that the XHTTP inbound silently
-        # fails. proxy_pass + HTTP/1.1 + packet-up works through Cloudflare
-        # (and ArvanCloud) with default settings. Response buffering MUST be
-        # off so the long-lived down-link GET stream is not held by nginx.
+        # XHTTP behind a CDN is served over plain HTTP/1.1 with proxy_pass.
+        # UNLIKE ws/httpupgrade, XHTTP's own server handler (splithttp/hub.go)
+        # validates the incoming Host/path itself as part of session routing.
+        # Sending it an external domain (the CDN domain, via an explicit
+        # proxy_set_header Host) is exactly the kind of value that trips this
+        # validation and rejects the connection -- while ws/httpupgrade use a
+        # completely different code path that tolerates it fine, which is why
+        # XHTTP alone kept failing. FIX: no Host override at all for this
+        # location; nginx then sends its own default ($proxy_host, i.e. the
+        # literal 127.0.0.1:port backend address), which XHTTP accepts.
+        # Response buffering MUST be off so the long-lived down-link GET
+        # stream is not held by nginx.
         printf '    location ^~ %s {\n' "$p"
         printf '        proxy_pass http://127.0.0.1:%s;\n' "$port"
         printf '        proxy_http_version 1.1;\n'
-        printf '        proxy_set_header Host %s;\n' "$hostheader"
         printf '        proxy_set_header X-Real-IP $remote_addr;\n'
         printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
         printf '        proxy_set_header X-Forwarded-Proto $scheme;\n'
@@ -1421,8 +1475,8 @@ LOGROT_EOF
 
     echo ""
     echo -e "${INFO}================= ROUTING SUMMARY =================${RESET}"
-    echo -e "${C_LIME}CDN domain:${RESET}   ${CDN_DOMAIN}  (ws/xhttp/httpupgrade only)"
-    echo -e "${C_ROSE}Panel domain:${RESET} ${PANEL_DOMAIN}  (-> 127.0.0.1:${PANEL_PORT})"
+    echo -e "${C4}CDN domain:${RESET}   ${CDN_DOMAIN}  (ws/xhttp/httpupgrade only)"
+    echo -e "${C5}Panel domain:${RESET} ${PANEL_DOMAIN}  (-> 127.0.0.1:${PANEL_PORT})"
     if [ -n "$CDN_ROUTED_SUMMARY" ]; then
         echo -e "${CDN_BG} Routed through CDN: ${RESET}"
         echo -e "${CDN_ROUTED_SUMMARY}"
@@ -1724,7 +1778,7 @@ colorize_access_line() {
         5*) echo -e "${ERR_BG} ${code} ${RESET} ${C_ERR}$line${RESET}" ;;
         4*) echo -e "${WARN_BG} ${code} ${RESET} \033[1;33m$line${RESET}" ;;
         2*|3*) echo -e "${OK_BG} ${code} ${RESET} ${C_OK}$line${RESET}" ;;
-        *) echo -e "${C_TEALGREY}$line${RESET}" ;;
+        *) echo -e "${C8}$line${RESET}" ;;
     esac
 }
 
@@ -1734,7 +1788,7 @@ view_logs() {
     for f in "$logdir"/*.log; do [ -f "$f" ] || continue; i=$((i+1)); LOGS[$i]="$f"; done
     [ "$i" -gt 0 ] || { warn "No logs found."; return; }
     echo -e "${INFO}Logs:${RESET}"
-    for n in $(seq 1 "$i"); do echo -e "    ${C_SKY}${n}) ${LOGS[$n]}${RESET}"; done
+    for n in $(seq 1 "$i"); do echo -e "    ${C6}${n}) ${LOGS[$n]}${RESET}"; done
     local PICK; ask_number PICK "Select"
     { [ "$PICK" -ge 1 ] && [ "$PICK" -le "$i" ]; } || return
     tail -n 50 "${LOGS[$PICK]}" | while IFS= read -r line; do colorize_access_line "$line"; done
@@ -1767,40 +1821,85 @@ do_install() {
 
 menu() {
     while true; do
-        clear; echo -e "${TITLE}"; header; echo -e "${RESET}"
-        echo -e "  ${C_PINK}1)  Install${RESET}"
-        echo -e "  ${C_OLIVE}2)  Start${RESET}"
-        echo -e "  ${C_LPINK}3)  Stop${RESET}"
-        echo -e "  ${C_TEALGREY}4)  Restart${RESET}"
-        echo -e "  ${C_CHOC}5)  Reload${RESET}"
-        echo -e "  ${C_LCHOC}6)  Status${RESET}"
-        echo -e "  ${C_SKY}7)  Logs${RESET}"
-        echo -e "  ${C_PURPLE}8)  Remove Domain${RESET}"
-        echo -e "  ${C_GOLD}9)  Firewall${RESET}"
-        echo -e "  ${C_ORANGE}10) Firewall Status${RESET}"
-        echo -e "  ${C_DEEPTEAL}11) Auto-Start${RESET}"
-        echo -e "  ${C_CYAN2}12) Verify${RESET}"
-        echo -e "  ${C_MAGENTA2}13) Diagnose${RESET}"
-        echo -e "  ${C_ERR}14) Uninstall${RESET}"
-        echo -e "  ${C_ERR}0)  Exit${RESET}"
+        draw_header
+        echo -e "  ${C1}1) Install${RESET}"
+        echo -e "  ${C2}2) Server Management${RESET}"
+        echo -e "  ${C3}3) Domain & Firewall${RESET}"
+        echo -e "  ${C4}4) Diagnostics${RESET}"
+        echo -e "  ${C5}5) Uninstall${RESET}"
+        echo -e "  ${C8}0) Exit${RESET}"
         local CH; ask_optional CH "Choose"
         case "$CH" in
-            1)  do_install ;;
-            2)  svc start ;;
-            3)  svc stop ;;
-            4)  svc restart ;;
-            5)  svc reload ;;
-            6)  show_status ;;
-            7)  view_logs ;;
-            8)  uninstall_domain ;;
-            9)  setup_firewall ;;
-            10) firewall_status ;;
-            11) enable_persistence ;;
-            12) verify_cdn_binding_menu ;;
-            13) diagnose_delayed_disconnect ;;
-            14) full_uninstall ;;
-            0)  exit 0 ;;
-            *)  err "Invalid choice." ;;
+            1) do_install ;;
+            2) menu_server_management ;;
+            3) menu_domain_firewall ;;
+            4) menu_diagnostics ;;
+            5) full_uninstall ;;
+            0) exit 0 ;;
+            *) err "Invalid choice." ;;
+        esac
+        local _; ask_optional _ "Press Enter to continue..."
+    done
+}
+
+menu_server_management() {
+    while true; do
+        draw_header
+        echo -e "  ${C1}1) Start${RESET}"
+        echo -e "  ${C2}2) Stop${RESET}"
+        echo -e "  ${C3}3) Restart${RESET}"
+        echo -e "  ${C4}4) Reload${RESET}"
+        echo -e "  ${C5}5) Status${RESET}"
+        echo -e "  ${C6}6) Logs${RESET}"
+        echo -e "  ${C7}7) Auto-Start${RESET}"
+        echo -e "  ${C8}0) Back${RESET}"
+        local CH; ask_optional CH "Choose"
+        case "$CH" in
+            1) svc start ;;
+            2) svc stop ;;
+            3) svc restart ;;
+            4) svc reload ;;
+            5) show_status ;;
+            6) view_logs ;;
+            7) enable_persistence ;;
+            0) return ;;
+            *) err "Invalid choice." ;;
+        esac
+        local _; ask_optional _ "Press Enter to continue..."
+    done
+}
+
+menu_domain_firewall() {
+    while true; do
+        draw_header
+        echo -e "  ${C1}1) Remove Domain${RESET}"
+        echo -e "  ${C2}2) Firewall Setup${RESET}"
+        echo -e "  ${C3}3) Firewall Status${RESET}"
+        echo -e "  ${C8}0) Back${RESET}"
+        local CH; ask_optional CH "Choose"
+        case "$CH" in
+            1) uninstall_domain ;;
+            2) setup_firewall ;;
+            3) firewall_status ;;
+            0) return ;;
+            *) err "Invalid choice." ;;
+        esac
+        local _; ask_optional _ "Press Enter to continue..."
+    done
+}
+
+menu_diagnostics() {
+    while true; do
+        draw_header
+        echo -e "  ${C1}1) Verify CDN Binding${RESET}"
+        echo -e "  ${C2}2) Diagnose Disconnects${RESET}"
+        echo -e "  ${C8}0) Back${RESET}"
+        local CH; ask_optional CH "Choose"
+        case "$CH" in
+            1) verify_cdn_binding_menu ;;
+            2) diagnose_delayed_disconnect ;;
+            0) return ;;
+            *) err "Invalid choice." ;;
         esac
         local _; ask_optional _ "Press Enter to continue..."
     done
