@@ -278,6 +278,23 @@ make_location() {
     fi
 }
 
+make_panel_location() {
+    local p="$1" port="$2"
+    [ "${p:0:1}" != "/" ] && p="/$p"
+    printf '    location ^~ %s {\n' "$p"
+    printf '        proxy_pass http://127.0.0.1:%s;\n' "$port"
+    printf '        proxy_http_version 1.1;\n'
+    printf '        proxy_set_header Upgrade $http_upgrade;\n'
+    printf '        proxy_set_header Connection "upgrade";\n'
+    printf '        proxy_set_header Host $host;\n'
+    printf '        proxy_set_header X-Real-IP $remote_addr;\n'
+    printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+    printf '        proxy_set_header X-Forwarded-Proto $scheme;\n'
+    printf '        proxy_read_timeout 300s;\n'
+    printf '        proxy_send_timeout 300s;\n'
+    printf '    }\n'
+}
+
 free_port() {
     local p
     for p in $(seq 20000 29999); do
@@ -871,11 +888,41 @@ find_index_html_auto() {
 # ---------------- Setup Flow ----------------
 gather_inputs() {
     CDN_ROUTED_SUMMARY=""; NONCDN_SUMMARY=""; HOSTFIX_SUMMARY=""; FAILED_SUMMARY=""
+    PANEL_PATH=""; SUB_PORT=""; SUB_PATH=""
 
     echo -e "${INFO}=== Panel ===${RESET}"
     ask RAW_PANEL "Panel Domain"
     PANEL_DOMAIN=$(strip_scheme "$RAW_PANEL"); PANEL_DOMAIN=$(strip_port "$PANEL_DOMAIN")
     ask_port PANEL_PORT "Panel Port" 2053
+
+    local PANEL_PATH_RAW
+    ask_optional PANEL_PATH_RAW "Panel Path" "(blank = panel on domain root; e.g. /myadminpath to hide it behind a path on port 443)"
+    if [ -n "$PANEL_PATH_RAW" ]; then
+        [ "${PANEL_PATH_RAW:0:1}" = "/" ] || PANEL_PATH_RAW="/$PANEL_PATH_RAW"
+        PANEL_PATH_RAW="${PANEL_PATH_RAW%/}"
+        [ -z "$PANEL_PATH_RAW" ] && PANEL_PATH_RAW="/"
+        PANEL_PATH="$PANEL_PATH_RAW"
+    fi
+
+    local ADDSUB
+    ask_optional ADDSUB "Also proxy the Subscription service through this domain (e.g. if its port can't be opened directly)?" "[y/N]"
+    if is_yes "$ADDSUB"; then
+        ask_port SUB_PORT "Subscription Port" 2096
+        local SUB_PATH_RAW __eff_panel_path
+        while true; do
+            ask SUB_PATH_RAW "Subscription Path" "e.g. /mysub"
+            [ "${SUB_PATH_RAW:0:1}" = "/" ] || SUB_PATH_RAW="/$SUB_PATH_RAW"
+            SUB_PATH_RAW="${SUB_PATH_RAW%/}"
+            [ -z "$SUB_PATH_RAW" ] && SUB_PATH_RAW="/"
+            __eff_panel_path="${PANEL_PATH:-/}"
+            if [ "$SUB_PATH_RAW" = "$__eff_panel_path" ]; then
+                warn "Subscription path can't be the same as the panel path (${__eff_panel_path})."
+                continue
+            fi
+            SUB_PATH="$SUB_PATH_RAW"
+            break
+        done
+    fi
 
     echo -e "${INFO}=== CDN ===${RESET}"
     ask RAW_CDN "CDN Domain"
@@ -888,6 +935,12 @@ gather_inputs() {
         err "nginx has to listen on ${HTTPS_PORT} to front your CDN inbounds and camouflage site,"
         err "so the x-ui panel CANNOT also use ${PANEL_PORT}. In the x-ui panel, set the web"
         err "'Panel Port' to something internal like 2053 or 8443, then run Install again."
+        exit 1
+    fi
+
+    if [ -n "$SUB_PORT" ] && { [ "$SUB_PORT" = "$HTTPS_PORT" ] || [ "$SUB_PORT" = "$HTTP_PORT" ]; }; then
+        err "Subscription port (${SUB_PORT}) collides with the port nginx must own (${HTTPS_PORT}/${HTTP_PORT})."
+        err "Set a different internal Subscription Port in the x-ui panel (e.g. 2096), then run Install again."
         exit 1
     fi
 
@@ -1138,23 +1191,21 @@ write_config() {
 
     if [ "$PANEL_DOMAIN" != "$CDN_DOMAIN" ]; then
         local panel_conf="${NGINX_CONF_DIR}/${PANEL_DOMAIN}.conf"
-        local panel_proxy
-        panel_proxy=$(cat <<PANELLOC
-    client_max_body_size 50m;
-    location / {
-        proxy_pass http://127.0.0.1:${PANEL_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-    }
-PANELLOC
-)
+        local effective_panel_path="${PANEL_PATH:-/}"
+        local panel_proxy="    client_max_body_size 50m;"
+        panel_proxy="${panel_proxy}"$'\n'"$(make_panel_location "$effective_panel_path" "$PANEL_PORT")"
+
+        if [ -n "$SUB_PATH" ] && [ -n "$SUB_PORT" ]; then
+            panel_proxy="${panel_proxy}"$'\n'"$(make_panel_location "$SUB_PATH" "$SUB_PORT")"
+        fi
+
+        local need_root_catch=1
+        [ "$effective_panel_path" = "/" ] && need_root_catch=0
+        [ -n "$SUB_PATH" ] && [ "$SUB_PATH" = "/" ] && need_root_catch=0
+        if [ "$need_root_catch" -eq 1 ]; then
+            panel_proxy="${panel_proxy}"$'\n'"    location / { return 404; }"
+        fi
+
         {
             echo "server {"
             echo "    listen ${HTTP_PORT};"
@@ -1182,7 +1233,21 @@ PANELLOC
             printf '%s\n' "${panel_proxy}"
             echo "}"
         } > "$panel_conf"
-        ok "Panel domain block written (${PANEL_DOMAIN}:${HTTP_PORT}+${HTTPS_PORT} -> 127.0.0.1:${PANEL_PORT})."
+
+        if [ "$effective_panel_path" = "/" ]; then
+            ok "Panel domain block written (${PANEL_DOMAIN}:${HTTP_PORT}+${HTTPS_PORT} -> 127.0.0.1:${PANEL_PORT})."
+        else
+            ok "Panel domain block written (${PANEL_DOMAIN}${effective_panel_path} -> 127.0.0.1:${PANEL_PORT}, root -> 404)."
+            warn "IMPORTANT: in the x-ui panel itself, set 'Web Base Path' (Panel Settings)"
+            warn "to exactly '${effective_panel_path}/' and restart x-ui -- otherwise the panel"
+            warn "will still redirect/serve assets from '/' and you'll get a blank page or a"
+            warn "login loop through the proxy."
+        fi
+        if [ -n "$SUB_PATH" ] && [ -n "$SUB_PORT" ]; then
+            ok "Subscription proxied: ${PANEL_DOMAIN}${SUB_PATH} -> 127.0.0.1:${SUB_PORT}."
+            warn "IMPORTANT: in the x-ui panel's Subscription Settings, set 'Sub Path' to"
+            warn "exactly '${SUB_PATH}/' and restart x-ui, for the same reason."
+        fi
     fi
 
     cat > /etc/logrotate.d/goldip-nginx <<LOGROT_EOF
@@ -1216,7 +1281,14 @@ LOGROT_EOF
     echo ""
     echo -e "${INFO}================= ROUTING SUMMARY =================${RESET}"
     echo -e "${C4}CDN domain:${RESET}   ${CDN_DOMAIN}  (ws/xhttp/httpupgrade only)"
-    echo -e "${C5}Panel domain:${RESET} ${PANEL_DOMAIN}  (-> 127.0.0.1:${PANEL_PORT})"
+    if [ "${PANEL_PATH:-/}" = "/" ]; then
+        echo -e "${C5}Panel domain:${RESET} ${PANEL_DOMAIN}  (-> 127.0.0.1:${PANEL_PORT})"
+    else
+        echo -e "${C5}Panel domain:${RESET} ${PANEL_DOMAIN}${PANEL_PATH}  (-> 127.0.0.1:${PANEL_PORT}, root -> 404)"
+    fi
+    if [ -n "${SUB_PATH:-}" ] && [ -n "${SUB_PORT:-}" ]; then
+        echo -e "${C5}Subscription:${RESET} ${PANEL_DOMAIN}${SUB_PATH}  (-> 127.0.0.1:${SUB_PORT})"
+    fi
     if [ -n "$CDN_ROUTED_SUMMARY" ]; then
         echo -e "${CDN_BG} Routed through CDN: ${RESET}"
         echo -e "${CDN_ROUTED_SUMMARY}"
