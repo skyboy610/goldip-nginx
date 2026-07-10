@@ -1,6 +1,6 @@
-#xh/bin/bash
+#!/bin/bash
 # ============================================================
-#  GoldIP Nginx Camouflage Installer & Manager  v4.5 (Fixed)
+#  GoldIP Nginx Camouflage Installer & Manager  v4.5 (Fixed-SSL)
 # ============================================================
 set -uo pipefail
 
@@ -1142,7 +1142,8 @@ write_config() {
         panel_proxy=$(cat <<PANELLOC
     client_max_body_size 50m;
     location / {
-        proxy_pass http://127.0.0.1:${PANEL_PORT};
+        proxy_pass https://127.0.0.1:${PANEL_PORT};
+        proxy_ssl_verify off;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -1182,7 +1183,7 @@ PANELLOC
             printf '%s\n' "${panel_proxy}"
             echo "}"
         } > "$panel_conf"
-        ok "Panel domain block written (${PANEL_DOMAIN}:${HTTP_PORT}+${HTTPS_PORT} -> 127.0.0.1:${PANEL_PORT})."
+        ok "Panel domain block written (${PANEL_DOMAIN}:${HTTP_PORT}+${HTTPS_PORT} -> https://127.0.0.1:${PANEL_PORT})."
     fi
 
     cat > /etc/logrotate.d/goldip-nginx <<LOGROT_EOF
@@ -1216,7 +1217,7 @@ LOGROT_EOF
     echo ""
     echo -e "${INFO}================= ROUTING SUMMARY =================${RESET}"
     echo -e "${C4}CDN domain:${RESET}   ${CDN_DOMAIN}  (ws/xhttp/httpupgrade only)"
-    echo -e "${C5}Panel domain:${RESET} ${PANEL_DOMAIN}  (-> 127.0.0.1:${PANEL_PORT})"
+    echo -e "${C5}Panel domain:${RESET} ${PANEL_DOMAIN}  (-> https://127.0.0.1:${PANEL_PORT})"
     if [ -n "$CDN_ROUTED_SUMMARY" ]; then
         echo -e "${CDN_BG} Routed through CDN: ${RESET}"
         echo -e "${CDN_ROUTED_SUMMARY}"
